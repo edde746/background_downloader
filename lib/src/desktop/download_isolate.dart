@@ -186,6 +186,7 @@ Future<TaskStatus> processOkDownloadResponse(
   IOSink? outStream;
   try {
     // do the actual download
+    Directory(p.dirname(tempFilePath)).createSync(recursive: true);
     outStream = File(
       tempFilePath,
     ).openWrite(mode: isResume ? FileMode.append : FileMode.write);
