@@ -593,7 +593,7 @@ object NotificationService {
             stateChange = groupNotification.update(taskWorker.task, notificationType)
             groupNotifications[groupNotificationId] = groupNotification
         }
-        if (stateChange) {
+        if (stateChange || taskWorker.runInForeground) {
             // need to update the group notification
             taskWorker.notificationId = groupNotification.notificationId
             val hasError = groupNotification.hasError
