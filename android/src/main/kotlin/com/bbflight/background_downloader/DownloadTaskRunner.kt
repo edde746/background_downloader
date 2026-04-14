@@ -28,14 +28,22 @@ import kotlin.random.Random
 
 class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
 
+    companion object {
+        private val contentRangeRegex = Regex("(\\d+)-(\\d+)/(\\d+)")
+    }
+
     private var eTagHeader: String? = null
     private var serverAcceptsRanges = false // if true, send resume data on fail
     private var tempFilePath = ""
     private var requiredStartByte = 0L // required start byte within the task range
     private var taskRangeStartByte = 0L // Start of the Task's download range
     private var eTag: String? = null
-    private var usesUri = false // true when downloading to a content:// or file:// URI
-    private var destUri: Uri? = null // destination URI for URI-based downloads
+    private var usesUri = false
+    private var destUri: Uri? = null
+
+    /** For SAF downloads, resume data stores the destUri; otherwise the temp file path. */
+    private fun resumeDataPath(): String =
+        if (usesUri && destUri != null) destUri.toString() else tempFilePath
 
     /**
      * Make the request to the [connection] and process the [Task]
@@ -308,13 +316,11 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
 
                 TaskStatus.paused -> {
                     BDPlugin.pausedTaskIds.remove(task.taskId)
-                    // For SAF (usesUri), store destUri as the resume data path
-                    val resumeDataPath = if (usesUri && destUri != null) destUri.toString() else tempFilePath
                     if (taskCanResume) {
                         Log.i(TAG, "Task ${task.taskId} paused")
                         processResumeData(
                             ResumeData(
-                                task, resumeDataPath, bytesTotal + startByte, eTagHeader
+                                task, resumeDataPath(), bytesTotal + startByte, eTagHeader
                             ), prefs
                         )
                         return TaskStatus.paused
@@ -324,7 +330,7 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
                         // so we only store local resumeData without posting it
                         Log.i(TAG, "Task ${task.taskId} paused in order to re-enqueue")
                         BDPlugin.localResumeData[task.taskId] = ResumeData(
-                            task, resumeDataPath, bytesTotal + startByte, eTagHeader
+                            task, resumeDataPath(), bytesTotal + startByte, eTagHeader
                         )
                         return TaskStatus.paused
                     }
@@ -355,12 +361,11 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
                             "Task ${task.taskId} paused due to timeout, will resume in 1 second"
                         )
                         val start = bytesTotal + startByte
-                        val timeoutResumePath = if (usesUri && destUri != null) destUri.toString() else tempFilePath
                         val success = BDPlugin.doEnqueue(
                             context.appContext,
                             task,
                             notificationConfigJsonString,
-                            ResumeData(task, timeoutResumePath, start, eTagHeader),
+                            ResumeData(task, resumeDataPath(), start, eTagHeader),
                             1000
                         )
                         if (!success) {
@@ -453,7 +458,11 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
             }
             // Can't truncate SAF files — if size mismatches, delete and restart
             Log.i(TAG, "SAF file size $fileSize != required $requiredStartByte, restarting")
-            try { context.appContext.contentResolver.delete(resumeUri, null, null) } catch (_: Exception) {}
+            try {
+                context.appContext.contentResolver.delete(resumeUri, null, null)
+            } catch (e: Exception) {
+                Log.i(TAG, "Could not delete SAF file at $resumeUri: ${e.message}")
+            }
             return false
         }
 
@@ -505,7 +514,7 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
                 return false
             }
             val range = contentRanges.first()
-            val matchResult = Regex("(\\d+)-(\\d+)/(\\d+)").find(range) ?: return false
+            val matchResult = contentRangeRegex.find(range) ?: return false
             startByte = matchResult.groups[1]?.value?.toLong()!! - taskRangeStartByte
             return true
         }
@@ -518,8 +527,7 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
             return false
         }
         val range = contentRanges.first()
-        val contentRangeRegEx = Regex("(\\d+)-(\\d+)/(\\d+)")
-        val matchResult = contentRangeRegEx.find(range)
+        val matchResult = contentRangeRegex.find(range)
         if (matchResult == null) {
             Log.i(TAG, "Could not process partial response Content-Range $range")
             taskException = TaskException(
@@ -564,11 +572,9 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
     private suspend fun prepResumeAfterFailure() {
         if (serverAcceptsRanges && bytesTotal + startByte > 1 shl 20) {
             // if failure can be resumed, post resume data
-            // For SAF (usesUri), store destUri as the resume data path
-            val failureResumePath = if (usesUri && destUri != null) destUri.toString() else tempFilePath
             processResumeData(
                 ResumeData(
-                    task, failureResumePath, bytesTotal + startByte, eTagHeader
+                    task, resumeDataPath(), bytesTotal + startByte, eTagHeader
                 ), prefs
             )
         } else {
