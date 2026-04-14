@@ -132,10 +132,11 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
                     if (uriFilename.isEmpty()) {
                         uriFilename = "${Random.nextInt().absoluteValue}"
                     }
+                    val uri = destUri
                     task = task.copyWith(
-                        filename = if (destUri == null) uriFilename else UriUtils.pack(
+                        filename = if (uri == null) uriFilename else UriUtils.pack(
                             uriFilename,
-                            destUri
+                            uri
                         )
                     )
                 } else {
@@ -211,11 +212,11 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
                         val destFile = File(dirObject, uriFilename)
                         destUri = Uri.fromFile(destFile)
                         // Store destination Uri in task
-                        task = task.copyWith(filename = UriUtils.pack(uriFilename, destUri))
+                        task = task.copyWith(filename = UriUtils.pack(uriFilename, destUri!!))
                         FileOutputStream(destFile, isResume) // return outputStream
                     } else {
                         // use destination Uri that was set in previous attempt
-                        FileOutputStream(destUri.toFile(), isResume)
+                        FileOutputStream(destUri!!.toFile(), isResume)
                     }
                 } else {
                     // other URL scheme will be attempted to resolve using content resolver
@@ -223,7 +224,8 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
                     // create destination Uri if not already exists
                     val documentFile = DocumentFile.fromTreeUri(context.appContext, directoryUri)
                     destUri = destUri ?: documentFile?.createFile(task.mimeType, uriFilename)?.uri
-                    if (destUri == null) {
+                    val resolvedUri = destUri
+                    if (resolvedUri == null) {
                         val message =
                             "Failed to create document within directory with URI: $directoryUri"
                         Log.e(TAG, message)
@@ -233,12 +235,12 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
                         )
                         return TaskStatus.failed
                     }
-                    val newFilename = getFilenameFromUri(destUri)
+                    val newFilename = getFilenameFromUri(resolvedUri)
                     if (newFilename.isNotEmpty()) {
                         uriFilename = newFilename
                     }
-                    task = task.copyWith(filename = UriUtils.pack(uriFilename, destUri))
-                    val os = resolver.openOutputStream(destUri, if (isResume) "wa" else "w")
+                    task = task.copyWith(filename = UriUtils.pack(uriFilename, resolvedUri))
+                    val os = resolver.openOutputStream(resolvedUri, if (isResume) "wa" else "w")
                     if (os == null) {
                         val message = "Failed to open output stream for URI: $destUri"
                         Log.e(TAG, message)
