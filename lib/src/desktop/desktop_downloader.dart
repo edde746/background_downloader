@@ -62,7 +62,7 @@ final class DesktopDownloader extends BaseDownloader {
       _log.fine('Invalid url: ${task.url} error: $e');
       return false;
     }
-    super.enqueue(task);
+    await super.enqueue(task);
     _queue.add(task);
     processStatusUpdate(TaskStatusUpdate(task, TaskStatus.enqueued));
     _advanceQueue();
@@ -147,10 +147,14 @@ final class DesktopDownloader extends BaseDownloader {
     }
 
     final resumeData = await getResumeData(task.taskId);
-    if (resumeData != null) {
-      await removeResumeData(task.taskId);
-    }
     final isResume = _resume.remove(task) && resumeData != null;
+    if (resumeData != null) {
+      if (isResume) {
+        await removeResumeData(task.taskId);
+      } else {
+        await discardResumeData(task.taskId);
+      }
+    }
     // spawn an isolate to do the task
     final receivePort = ReceivePort();
     final errorPort = ReceivePort();
