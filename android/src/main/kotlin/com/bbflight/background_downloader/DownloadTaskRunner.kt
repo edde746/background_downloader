@@ -218,9 +218,20 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
                 } else {
                     // other URL scheme will be attempted to resolve using content resolver
                     val resolver = context.appContext.contentResolver
+                    val targetFilename = uriFilename ?: "unknown"
                     // create destination Uri if not already exists
                     val documentFile = DocumentFile.fromTreeUri(context.appContext, directoryUri)
-                    destUri = destUri ?: documentFile?.createFile(task.mimeType, uriFilename)?.uri
+                    if (destUri != null && !safFileExists(destUri)) {
+                        Log.i(TAG, "Ignoring stale SAF destination Uri $destUri")
+                        destUri = null
+                    }
+                    val shouldReuseSafFile =
+                        task.retriesRemaining < task.retries || requiredStartByte > 0
+                    if (destUri == null && shouldReuseSafFile) {
+                        destUri = findSafFile(documentFile, targetFilename)
+                    }
+                    destUri = destUri
+                        ?: documentFile?.createFile(task.mimeType, targetFilename)?.uri
                     if (destUri == null) {
                         val message =
                             "Failed to create document within directory with URI: $directoryUri"
@@ -367,7 +378,6 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
                 }
 
                 TaskStatus.failed -> {
-                    prepResumeAfterFailure()
                     return TaskStatus.failed
                 }
 
@@ -430,18 +440,26 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
         // SAF resume: resume data stores a content:// URI instead of a temp file path
         val resumeUri = Uri.parse(tempFilePath)
         if (resumeUri.scheme == "content") {
-            val docFile = DocumentFile.fromSingleUri(context.appContext, resumeUri)
-            val fileSize = docFile?.length() ?: 0
-            if (fileSize == requiredStartByte) {
-                Log.i(TAG, "SAF resume: file size matches at $requiredStartByte bytes")
-                return true
-            }
-            // Can't truncate SAF files — if size mismatches, delete and restart
-            Log.i(TAG, "SAF file size $fileSize != required $requiredStartByte, restarting")
             try {
-                context.appContext.contentResolver.delete(resumeUri, null, null)
+                val docFile = DocumentFile.fromSingleUri(context.appContext, resumeUri)
+                if (docFile?.exists() != true) {
+                    Log.i(TAG, "SAF resume file not available, restarting")
+                    return false
+                }
+                val fileSize = docFile.length()
+                if (fileSize == requiredStartByte) {
+                    Log.i(TAG, "SAF resume: file size matches at $requiredStartByte bytes")
+                    return true
+                }
+                // Can't truncate SAF files — if size mismatches, delete and restart
+                Log.i(TAG, "SAF file size $fileSize != required $requiredStartByte, restarting")
+                try {
+                    context.appContext.contentResolver.delete(resumeUri, null, null)
+                } catch (e: Exception) {
+                    Log.i(TAG, "Could not delete SAF file at $resumeUri: ${e.message}")
+                }
             } catch (e: Exception) {
-                Log.i(TAG, "Could not delete SAF file at $resumeUri: ${e.message}")
+                Log.i(TAG, "Could not inspect SAF resume file at $resumeUri: ${e.message}")
             }
             return false
         }
@@ -574,6 +592,30 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
             } catch (_: IOException) {
                 Log.i(TAG, "Could not delete temp file at $tempFilePath")
             }
+        }
+    }
+
+    /** Returns true if [uri] points to an existing SAF file. */
+    private fun safFileExists(uri: Uri?): Boolean {
+        if (uri == null) return false
+        return try {
+            val file = DocumentFile.fromSingleUri(context.appContext, uri)
+            file?.exists() == true && file.isFile
+        } catch (e: Exception) {
+            Log.i(TAG, "Could not check SAF file at $uri: ${e.message}")
+            false
+        }
+    }
+
+    /** Find an existing SAF file by name so retries overwrite instead of auto-number. */
+    private fun findSafFile(directory: DocumentFile?, filename: String): Uri? {
+        if (directory == null) return null
+        return try {
+            val file = directory.findFile(filename)
+            if (file?.isFile == true) file.uri else null
+        } catch (e: Exception) {
+            Log.i(TAG, "Could not find SAF file $filename: ${e.message}")
+            null
         }
     }
 

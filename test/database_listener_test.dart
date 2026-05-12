@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:background_downloader/src/database.dart';
@@ -13,10 +14,12 @@ final defaultTask = DownloadTask(
 );
 
 late Database db;
+late MockPersistentStorage storage;
 
 void main() {
   setUp(() {
-    db = Database(MockPersistentStorage());
+    storage = MockPersistentStorage();
+    db = Database(storage);
   });
 
   tearDown(() {
@@ -64,91 +67,153 @@ void main() {
       expect(emittedRecord1, equals(record));
       expect(emittedRecord2, equals(record));
     });
+
+    test('deleteRecordWithId discards resume temp file and state', () async {
+      final tempDir = await Directory.systemTemp.createTemp(
+        'bd_resume_cleanup_',
+      );
+      addTearDown(() async {
+        if (await tempDir.exists()) {
+          await tempDir.delete(recursive: true);
+        }
+      });
+
+      final tempFile = File(
+        '${tempDir.path}${Platform.pathSeparator}com.bbflight.background_downloader123',
+      );
+      await tempFile.writeAsString('partial');
+      final task = defaultTask.copyWith(taskId: 'cleanup-task');
+
+      await storage.storeTaskRecord(
+        TaskRecord(task, TaskStatus.failed, progressFailed, 100),
+      );
+      await storage.storePausedTask(task);
+      await storage.storeResumeData(ResumeData(task, tempFile.path, 50, 'tag'));
+
+      expect(await tempFile.exists(), isTrue);
+
+      await db.deleteRecordWithId(task.taskId);
+
+      expect(await tempFile.exists(), isFalse);
+      expect(await storage.retrieveTaskRecord(task.taskId), isNull);
+      expect(await storage.retrievePausedTask(task.taskId), isNull);
+      expect(await storage.retrieveResumeData(task.taskId), isNull);
+    });
+
+    test('deleteRecordWithId preserves file uri resume data targets', () async {
+      final tempDir = await Directory.systemTemp.createTemp(
+        'bd_resume_uri_cleanup_',
+      );
+      addTearDown(() async {
+        if (await tempDir.exists()) {
+          await tempDir.delete(recursive: true);
+        }
+      });
+
+      final targetFile = File(
+        '${tempDir.path}${Platform.pathSeparator}destination-file',
+      );
+      await targetFile.writeAsString('partial');
+      final task = defaultTask.copyWith(taskId: 'cleanup-uri-task');
+
+      await storage.storeTaskRecord(
+        TaskRecord(task, TaskStatus.failed, progressFailed, 100),
+      );
+      await storage
+          .storeResumeData(ResumeData(task, targetFile.uri.toString()));
+
+      await db.deleteRecordWithId(task.taskId);
+
+      expect(await targetFile.exists(), isTrue);
+      expect(await storage.retrieveResumeData(task.taskId), isNull);
+    });
   });
 }
 
 class MockPersistentStorage implements PersistentStorage {
+  final _taskRecords = <String, TaskRecord>{};
+  final _pausedTasks = <String, Task>{};
+  final _resumeData = <String, ResumeData>{};
+
   @override
-  Future<void> storeTaskRecord(TaskRecord record) {
-    return Future.value();
+  Future<void> storeTaskRecord(TaskRecord record) async {
+    _taskRecords[record.taskId] = record;
   }
 
   @override
   Future<TaskRecord?> retrieveTaskRecord(String taskId) {
-    return Future.value(TaskRecord(defaultTask, TaskStatus.running, 0.0, 100));
+    return Future.value(_taskRecords[taskId]);
   }
 
   @override
   Future<List<TaskRecord>> retrieveAllTaskRecords() {
-    return Future.value([
-      TaskRecord(defaultTask, TaskStatus.running, 0.0, 100),
-    ]);
+    return Future.value(_taskRecords.values.toList());
   }
 
   @override
-  Future<void> removeTaskRecord(String? taskId) {
-    return Future.value();
+  Future<void> removeTaskRecord(String? taskId) async {
+    if (taskId == null) {
+      _taskRecords.clear();
+    } else {
+      _taskRecords.remove(taskId);
+    }
   }
 
   @override
-  // TODO: implement currentDatabaseVersion
-  (String, int) get currentDatabaseVersion => throw UnimplementedError();
+  (String, int) get currentDatabaseVersion => ('mock', 1);
 
   @override
-  Future<void> initialize() {
-    // TODO: implement initialize
-    throw UnimplementedError();
+  Future<void> initialize() async {}
+
+  @override
+  Future<void> removePausedTask(String? taskId) async {
+    if (taskId == null) {
+      _pausedTasks.clear();
+    } else {
+      _pausedTasks.remove(taskId);
+    }
   }
 
   @override
-  Future<void> removePausedTask(String? taskId) {
-    // TODO: implement removePausedTask
-    throw UnimplementedError();
-  }
-
-  @override
-  Future<void> removeResumeData(String? taskId) {
-    // TODO: implement removeResumeData
-    throw UnimplementedError();
+  Future<void> removeResumeData(String? taskId) async {
+    if (taskId == null) {
+      _resumeData.clear();
+    } else {
+      _resumeData.remove(taskId);
+    }
   }
 
   @override
   Future<List<Task>> retrieveAllPausedTasks() {
-    // TODO: implement retrieveAllPausedTasks
-    throw UnimplementedError();
+    return Future.value(_pausedTasks.values.toList());
   }
 
   @override
   Future<List<ResumeData>> retrieveAllResumeData() {
-    // TODO: implement retrieveAllResumeData
-    throw UnimplementedError();
+    return Future.value(_resumeData.values.toList());
   }
 
   @override
   Future<Task?> retrievePausedTask(String taskId) {
-    // TODO: implement retrievePausedTask
-    throw UnimplementedError();
+    return Future.value(_pausedTasks[taskId]);
   }
 
   @override
   Future<ResumeData?> retrieveResumeData(String taskId) {
-    // TODO: implement retrieveResumeData
-    throw UnimplementedError();
+    return Future.value(_resumeData[taskId]);
   }
 
   @override
-  Future<void> storePausedTask(Task task) {
-    // TODO: implement storePausedTask
-    throw UnimplementedError();
+  Future<void> storePausedTask(Task task) async {
+    _pausedTasks[task.taskId] = task;
   }
 
   @override
-  Future<void> storeResumeData(ResumeData resumeData) {
-    // TODO: implement storeResumeData
-    throw UnimplementedError();
+  Future<void> storeResumeData(ResumeData resumeData) async {
+    _resumeData[resumeData.taskId] = resumeData;
   }
 
   @override
-  // TODO: implement storedDatabaseVersion
-  Future<(String, int)> get storedDatabaseVersion => throw UnimplementedError();
+  Future<(String, int)> get storedDatabaseVersion =>
+      Future.value(currentDatabaseVersion);
 }

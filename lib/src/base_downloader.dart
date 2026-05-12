@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
 
@@ -7,7 +6,6 @@ import 'package:collection/collection.dart';
 import 'package:flutter/foundation.dart';
 import 'package:logging/logging.dart';
 
-import 'chunk.dart';
 import 'database.dart';
 import 'exceptions.dart';
 import 'file_downloader.dart';
@@ -16,6 +14,7 @@ import 'native_downloader.dart';
 import 'permissions.dart';
 import 'persistent_storage.dart';
 import 'queue/task_queue.dart';
+import 'resume_data_cleanup.dart';
 import 'task.dart';
 import 'web_downloader.dart'
     if (dart.library.io) 'desktop/desktop_downloader.dart';
@@ -95,6 +94,9 @@ abstract base class BaseDownloader {
 
   /// Map of tasks and completer to indicate whether task can be resumed
   final canResumeTask = <Task, Completer<bool>>{};
+
+  /// Tokens that allow re-enqueue/resume to invalidate delayed cleanup sweeps
+  final _resumeDataSweepTokens = <String, Object>{};
 
   /// Flag indicating we have retrieved missed data
   @visibleForTesting
@@ -265,6 +267,10 @@ abstract base class BaseDownloader {
   /// Enqueue the task
   @mustCallSuper
   Future<bool> enqueue(Task task) async {
+    _invalidateResumeDataSweep(task.taskId);
+    if (await getResumeData(task.taskId) == null) {
+      await _discardResumeDataForReplacement(task);
+    }
     if (task.allowPause) {
       canResumeTask[task] = Completer();
     }
@@ -273,6 +279,42 @@ abstract base class BaseDownloader {
 
   /// Enqueue a list of tasks
   Future<List<bool>> enqueueAll(Iterable<Task> tasks);
+
+  /// Prepares a batch of tasks for native enqueue.
+  ///
+  /// This mirrors [enqueue]'s shared bookkeeping while retrieving resume data
+  /// once for the whole batch instead of once per task.
+  @protected
+  Future<List<Task>> prepareEnqueueAll(Iterable<Task> tasks) async {
+    await ready;
+    final taskList = tasks.toList(growable: false);
+    if (taskList.isEmpty) return taskList;
+
+    final allResumeData = await _storage.retrieveAllResumeData();
+    final existingResumeTaskIds = allResumeData
+        .map((resumeData) => resumeData.taskId)
+        .toSet();
+    final targetPaths = <String>{};
+    for (final task in taskList) {
+      _invalidateResumeDataSweep(task.taskId);
+      if (task.allowPause) {
+        canResumeTask[task] = Completer();
+      }
+      if (!existingResumeTaskIds.contains(task.taskId)) {
+        final targetPath = await _replacementPath(task);
+        if (targetPath != null) targetPaths.add(targetPath);
+      }
+    }
+    if (targetPaths.isNotEmpty) {
+      for (final data in allResumeData) {
+        final existingPath = await _replacementPath(data.task);
+        if (existingPath != null && targetPaths.contains(existingPath)) {
+          await discardResumeData(data.taskId);
+        }
+      }
+    }
+    return taskList;
+  }
 
   /// Enqueue the [task] and wait for completion
   ///
@@ -399,15 +441,19 @@ abstract base class BaseDownloader {
   ///  Returns the number of tasks canceled
   @mustCallSuper
   Future<int> reset(String group) async {
-    final retryCount = tasksWaitingToRetry
+    final tasksWaitingToRetryInGroup = tasksWaitingToRetry
         .where((task) => task.group == group)
-        .length;
+        .toList(growable: false);
+    final retryCount = tasksWaitingToRetryInGroup.length;
+    for (final task in tasksWaitingToRetryInGroup) {
+      _clearPauseResumeInfo(task);
+    }
     tasksWaitingToRetry.removeWhere((task) => task.group == group);
     final pausedTasks = await getPausedTasks();
     var pausedCount = 0;
     for (final task in pausedTasks) {
       if (task.group == group) {
-        await removePausedTask(task.taskId);
+        _clearPauseResumeInfo(task);
         pausedCount++;
       }
     }
@@ -463,6 +509,7 @@ abstract base class BaseDownloader {
     // remove tasks waiting to retry from the list so they won't be retried
     for (final task in matchingTasksWaitingToRetry) {
       tasksWaitingToRetry.remove(task);
+      _clearPauseResumeInfo(task);
       processStatusUpdate(TaskStatusUpdate(task, TaskStatus.canceled));
       processProgressUpdate(TaskProgressUpdate(task, progressCanceled));
       updateNotification(task, null); // remove notification
@@ -516,35 +563,9 @@ abstract base class BaseDownloader {
         (element) => element.taskId == taskId,
       );
       if (task != null) {
-        final resumeData = await getResumeData(task.taskId);
-        if (resumeData != null) {
-          if (task is ParallelDownloadTask) {
-            final chunks = List<Chunk>.from(
-              jsonDecode(resumeData.data, reviver: Chunk.listReviver),
-            );
-            for (final chunk in chunks) {
-              final tempFilePath = (await getResumeData(
-                chunk.task.taskId,
-              ))?.tempFilepath;
-              if (tempFilePath != null) {
-                try {
-                  await File(tempFilePath).delete();
-                } on FileSystemException {
-                  log.fine('Could not delete temp file $tempFilePath');
-                }
-              }
-            }
-          } else {
-            if (!Platform.isIOS) {
-              final tempFilePath = resumeData.tempFilepath;
-              try {
-                await File(tempFilePath).delete();
-              } on FileSystemException {
-                log.fine('Could not delete temp file $tempFilePath');
-              }
-            }
-          }
-        }
+        await discardResumeData(task.taskId);
+        await removePausedTask(task.taskId);
+        canResumeTask.remove(task);
         processStatusUpdate(TaskStatusUpdate(task, TaskStatus.canceled));
         processProgressUpdate(TaskProgressUpdate(task, progressCanceled));
         updateNotification(task, TaskStatus.canceled);
@@ -664,6 +685,7 @@ abstract base class BaseDownloader {
   /// Returns true if successful
   @mustCallSuper
   Future<bool> resume(Task task) async {
+    _invalidateResumeDataSweep(task.taskId);
     await removePausedTask(task.taskId);
     if (await getResumeData(task.taskId) != null) {
       final currentCompleter = canResumeTask[task];
@@ -714,9 +736,25 @@ abstract base class BaseDownloader {
     return false;
   }
 
-  /// Stores the resume data
-  Future<void> setResumeData(ResumeData resumeData) =>
-      _storage.storeResumeData(resumeData);
+  /// Stores the resume data unless the task already reached a final state.
+  Future<void> setResumeData(ResumeData resumeData) async {
+    final record = await database.recordForId(resumeData.taskId);
+    final isWaitingToRetry = tasksWaitingToRetry.any(
+      (task) => task.taskId == resumeData.taskId,
+    );
+    // Native platforms normally post resumeData before the failed status that
+    // schedules a retry. If that ordering changes, the in-memory retry set keeps
+    // retryable resume data from being mistaken for orphaned final-state data.
+    if (record?.status.isFinalState == true && !isWaitingToRetry) {
+      await deleteResumeDataTempFiles(
+        resumeData,
+        getResumeData: getResumeData,
+        log: log,
+      );
+      return;
+    }
+    await _storage.storeResumeData(resumeData);
+  }
 
   /// Retrieve the resume data for this [taskId]
   Future<ResumeData?> getResumeData(String taskId) =>
@@ -725,6 +763,33 @@ abstract base class BaseDownloader {
   /// Remove resumeData for this [taskId], or all if null
   Future<void> removeResumeData([String? taskId]) =>
       _storage.removeResumeData(taskId);
+
+  /// Remove resumeData and delete its associated temp file(s).
+  Future<void> discardResumeData([String? taskId]) async {
+    final resumeData = <ResumeData>[];
+    final taskIds = <String>{if (taskId != null) taskId};
+    if (taskId == null) {
+      resumeData.addAll(await _storage.retrieveAllResumeData());
+    } else {
+      final data = await getResumeData(taskId);
+      if (data != null) resumeData.add(data);
+    }
+    for (final data in resumeData) {
+      taskIds.addAll(
+        await resumeDataTaskIds(data, getResumeData: getResumeData, log: log),
+      );
+      await deleteResumeDataTempFiles(
+        data,
+        getResumeData: getResumeData,
+        log: log,
+      );
+    }
+    if (taskId == null) {
+      await removeResumeData();
+    } else {
+      await Future.wait(taskIds.map(removeResumeData));
+    }
+  }
 
   /// Store the paused [task]
   Future<void> setPausedTask(Task task) => _storage.storePausedTask(task);
@@ -746,8 +811,45 @@ abstract base class BaseDownloader {
   /// Clear pause and resume info associated with this [task]
   void _clearPauseResumeInfo(Task task) {
     canResumeTask.remove(task);
-    removeResumeData(task.taskId);
-    removePausedTask(task.taskId);
+    unawaited(discardResumeData(task.taskId));
+    unawaited(removePausedTask(task.taskId));
+    // Native resumeData can arrive just after the final status update; sweep
+    // once more so the temp file does not survive without resumable state.
+    final sweepToken = Object();
+    _resumeDataSweepTokens[task.taskId] = sweepToken;
+    Timer(const Duration(seconds: 1), () {
+      if (_resumeDataSweepTokens[task.taskId] != sweepToken) return;
+      _resumeDataSweepTokens.remove(task.taskId);
+      unawaited(discardResumeData(task.taskId));
+    });
+  }
+
+  void _invalidateResumeDataSweep(String taskId) {
+    _resumeDataSweepTokens.remove(taskId);
+  }
+
+  Future<void> _discardResumeDataForReplacement(Task task) async {
+    await ready;
+    final targetPath = await _replacementPath(task);
+    if (targetPath == null) return;
+
+    final resumeData = await _storage.retrieveAllResumeData();
+    for (final data in resumeData) {
+      final existingPath = await _replacementPath(data.task);
+      if (existingPath == targetPath) {
+        await discardResumeData(data.taskId);
+      }
+    }
+  }
+
+  Future<String?> _replacementPath(Task task) async {
+    if (task is! DownloadTask || task is UriDownloadTask) return null;
+    try {
+      return await task.filePath();
+    } catch (e) {
+      log.fine('Could not resolve task destination for resume cleanup: $e');
+      return null;
+    }
   }
 
   /// Move the file represented by [filePath] to a shared storage
@@ -1149,8 +1251,9 @@ abstract base class BaseDownloader {
     notificationConfigs.clear();
     trackedGroups.clear();
     canResumeTask.clear();
-    removeResumeData(); // removes all
-    removePausedTask(); // removes all
+    _resumeDataSweepTokens.clear();
+    unawaited(discardResumeData()); // removes all
+    unawaited(removePausedTask()); // removes all
     resetUpdatesStreamController();
   }
 }

@@ -201,11 +201,11 @@ abstract base class NativeDownloader extends BaseDownloader {
 
       // resumeData Android and Desktop variant
       case ('resumeData', [String data, int requiredStartByte, String? eTag]):
-        setResumeData(ResumeData(task, data, requiredStartByte, eTag));
+        await setResumeData(ResumeData(task, data, requiredStartByte, eTag));
 
       // resumeData iOS and ParallelDownloads variant
       case ('resumeData', String data):
-        setResumeData(ResumeData(task, data));
+        await setResumeData(ResumeData(task, data));
 
       case ('notificationTap', int notificationTypeOrdinal):
         final notificationType =
@@ -255,7 +255,7 @@ abstract base class NativeDownloader extends BaseDownloader {
 
   @override
   Future<bool> enqueue(Task task) async {
-    super.enqueue(task);
+    await super.enqueue(task);
     final notificationConfig = notificationConfigForTask(task);
     return await methodChannel.invokeMethod<bool>('enqueue', [
           jsonEncode(task.toJson()),
@@ -268,14 +268,12 @@ abstract base class NativeDownloader extends BaseDownloader {
 
   @override
   Future<List<bool>> enqueueAll(Iterable<Task> tasks) async {
-    for (final task in tasks.where((task) => task.allowPause)) {
-      canResumeTask[task] = Completer();
-    }
+    final taskList = await prepareEnqueueAll(tasks);
     final (
       String tasksJsonString,
       String notificationConfigsJsonString,
     ) = await JsonProcessor().encodeTaskAndNotificationConfig(
-      tasks,
+      taskList,
       notificationConfigs,
     );
     final result =
@@ -363,10 +361,11 @@ abstract base class NativeDownloader extends BaseDownloader {
           : task;
       final taskResumeData = await getResumeData(task.taskId);
       if (taskResumeData != null) {
+        final resumeTask = taskResumeData.task;
         final notificationConfig = notificationConfigForTask(task);
         final enqueueSuccess =
             await methodChannel.invokeMethod<bool>('enqueue', [
-              jsonEncode(task.toJson()),
+              jsonEncode(resumeTask.toJson()),
               notificationConfig != null
                   ? jsonEncode(notificationConfig.toJson())
                   : null,
@@ -375,8 +374,8 @@ abstract base class NativeDownloader extends BaseDownloader {
               taskResumeData.eTag,
             ]) ??
             false;
-        if (enqueueSuccess && task is ParallelDownloadTask) {
-          return resumeChunkTasks(task, taskResumeData);
+        if (enqueueSuccess && resumeTask is ParallelDownloadTask) {
+          return resumeChunkTasks(resumeTask, taskResumeData);
         }
         return enqueueSuccess;
       }
@@ -621,10 +620,11 @@ final class AndroidDownloader extends NativeDownloader {
 
   @override
   Future<List<bool>> enqueueAll(Iterable<Task> tasks) async {
-    for (final task in tasks) {
+    final taskList = tasks.toList(growable: false);
+    for (final task in taskList) {
       await _registerCallbackDispatcher(task);
     }
-    return super.enqueueAll(tasks);
+    return super.enqueueAll(taskList);
   }
 
   /// On Android, need to register [_callbackDispatcherRawHandle] upon first

@@ -1,6 +1,8 @@
 ## 9.5.4
 
 * Add `TaskOptions` to `DataTask` with similar functionality as in `DownloadTask`
+* [Android] Delete resumable temporary files when resume state is discarded or replaced
+* [Android] Reuse existing SAF target files on URI download retries to avoid numbered duplicates
 * Bug fixes
 
 ## 9.5.3

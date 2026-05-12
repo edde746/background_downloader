@@ -755,6 +755,9 @@ interface class FileDownloader {
   /// the task is now enqueued for resume.
   /// If the task is able to resume, it will, otherwise it will restart the
   /// task from scratch, or fail.
+  ///
+  /// Native resume uses the task stored with the resume data. Mutating the task
+  /// argument between pause and resume is not supported.
   Future<bool> resume(DownloadTask task) => _downloader.resume(task);
 
   /// Resume all paused tasks, or those in [tasks], or paused tasks in

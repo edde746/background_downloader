@@ -6,6 +6,7 @@ import 'base_downloader.dart';
 import 'exceptions.dart';
 import 'models.dart';
 import 'persistent_storage.dart';
+import 'resume_data_cleanup.dart';
 import 'task.dart';
 
 /// Persistent database used for tracking task status and progress.
@@ -95,7 +96,9 @@ interface class Database {
   /// Optionally, specify a [group] to filter by
   Future<void> deleteAllRecords({String? group}) async {
     if (group == null) {
+      await _discardAllResumeData();
       await _storage.removeTaskRecord(null);
+      await _storage.removePausedTask(null);
       _updateCount = 0;
       return;
     }
@@ -112,8 +115,63 @@ interface class Database {
 
   /// Delete records with these [taskIds]
   Future<void> deleteRecordsWithIds(Iterable<String> taskIds) async {
+    final taskIdSet = taskIds.toSet();
+    await _discardResumeDataForTaskIds(taskIdSet);
     await Future.wait(
-      taskIds.map((taskId) => _storage.removeTaskRecord(taskId)),
+      taskIdSet.map((taskId) async {
+        await _storage.removeTaskRecord(taskId);
+        await _storage.removePausedTask(taskId);
+      }),
+    );
+  }
+
+  Future<void> _discardAllResumeData() async {
+    final allResumeData = await _storage.retrieveAllResumeData();
+    await Future.wait(allResumeData.map(_deleteResumeDataTempFiles));
+    await _storage.removeResumeData(null);
+  }
+
+  Future<void> _discardResumeData(String taskId) async {
+    final resumeData = await _storage.retrieveResumeData(taskId);
+    if (resumeData != null) {
+      final taskIds = await resumeDataTaskIds(
+        resumeData,
+        getResumeData: _storage.retrieveResumeData,
+        log: _log,
+      );
+      await _deleteResumeDataTempFiles(resumeData);
+      await Future.wait(taskIds.map(_storage.removeResumeData));
+    }
+  }
+
+  Future<void> _discardResumeDataForTaskIds(Set<String> taskIds) async {
+    if (taskIds.isEmpty) return;
+    if (taskIds.length == 1) {
+      await _discardResumeData(taskIds.first);
+      return;
+    }
+
+    final resumeTaskIds = {...taskIds};
+    final allResumeData = await _storage.retrieveAllResumeData();
+    for (final resumeData in allResumeData) {
+      if (!resumeTaskIds.contains(resumeData.taskId)) continue;
+      resumeTaskIds.addAll(
+        await resumeDataTaskIds(
+          resumeData,
+          getResumeData: _storage.retrieveResumeData,
+          log: _log,
+        ),
+      );
+      await _deleteResumeDataTempFiles(resumeData);
+    }
+    await Future.wait(resumeTaskIds.map(_storage.removeResumeData));
+  }
+
+  Future<void> _deleteResumeDataTempFiles(ResumeData resumeData) {
+    return deleteResumeDataTempFiles(
+      resumeData,
+      getResumeData: _storage.retrieveResumeData,
+      log: _log,
     );
   }
 
