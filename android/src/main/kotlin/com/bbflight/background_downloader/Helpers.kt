@@ -13,7 +13,6 @@ import com.bbflight.background_downloader.TaskRunner.Companion.TAG
 import io.flutter.plugin.common.MethodChannel
 import kotlinx.coroutines.CompletableDeferred
 import java.io.File
-import java.net.URLDecoder
 import javax.net.ssl.HttpsURLConnection
 import javax.net.ssl.SSLContext
 import javax.net.ssl.TrustManager
@@ -76,7 +75,7 @@ fun acceptUntrustedCertificates() {
  * space is greater than that setting
  * Returns true otherwise
  */
-fun insufficientSpace(applicationContext: Context, contentLength: Long): Boolean {
+fun insufficientSpace(applicationContext: Context, contentLength: Long, targetFile: File? = null): Boolean {
     if (contentLength <= 0) {
         return false
     }
@@ -85,7 +84,7 @@ fun insufficientSpace(applicationContext: Context, contentLength: Long): Boolean
     if (checkValue <= 0) {
         return false
     }
-    val path = Environment.getDataDirectory()
+    val path = targetFile?.parentFile ?: Environment.getDataDirectory()
     val stat = StatFs(path.path)
     val available = stat.blockSizeLong * stat.availableBlocksLong
     return available - (BDPlugin.remainingBytesToDownload.values.sum()
@@ -107,20 +106,29 @@ fun parseRange(rangeStr: String): Pair<Long, Long?> {
     return Pair(start, end)
 }
 
+fun headerValue(responseHeaders: Map<String, List<String>>, name: String): String? =
+    responseHeaders.entries.firstOrNull { it.key.equals(name, ignoreCase = true) }
+        ?.value
+        ?.firstOrNull { it.isNotEmpty() }
+
+fun taskHeaderValue(headers: Map<String, String>, name: String): String? =
+    headers.entries.firstOrNull { it.key.equals(name, ignoreCase = true) }
+        ?.value
+        ?.takeIf { it.isNotEmpty() }
+
 /**
  * Returns the content length extracted from the [responseHeaders], or from
  * the [task] headers
  */
 fun getContentLength(responseHeaders: Map<String, List<String>>, task: Task): Long {
     // if response provides contentLength, return it
-    val contentLength = responseHeaders["Content-Length"]?.get(0)?.toLongOrNull()
-        ?: responseHeaders["content-length"]?.get(0)?.toLongOrNull()
+    val contentLength = headerValue(responseHeaders, "Content-Length")?.toLongOrNull()
         ?: -1L
     if (contentLength != -1L) {
         return contentLength
     }
     // try extracting it from Range header
-    val taskRangeHeader = task.headers["Range"] ?: task.headers["range"] ?: ""
+    val taskRangeHeader = taskHeaderValue(task.headers, "Range") ?: ""
     val taskRange = parseRange(taskRangeHeader)
     if (taskRange.second != null) {
         val rangeLength = taskRange.second!! - taskRange.first + 1L
@@ -128,8 +136,7 @@ fun getContentLength(responseHeaders: Map<String, List<String>>, task: Task): Lo
         return rangeLength
     }
     // try extracting it from a special "Known-Content-Length" header
-    val knownLength = (task.headers["Known-Content-Length"]?.toLongOrNull()
-        ?: task.headers["known-content-length"]?.toLongOrNull()
+    val knownLength = (taskHeaderValue(task.headers, "Known-Content-Length")?.toLongOrNull()
         ?: -1)
     if (knownLength != -1L) {
         Log.d(
@@ -231,38 +238,10 @@ fun getUriFromFilePath(context: Context, filePath: String): String? {
  * @return A suggested filename, derived from the headers or the URL.
  */
 fun suggestFilename(responseHeaders: Map<String, List<String>>, url: String): String {
-    try {
-        val disposition = (responseHeaders["Content-Disposition"]
-            ?: responseHeaders["content-disposition"])?.get(0)
-        if (disposition != null) {
-            // Try filename*=UTF-8'language'"encodedFilename"
-            val encodedFilenameRegEx =
-                Regex("""filename\*=\s*([^']+)'([^']*)'"?([^"]+)"?""", RegexOption.IGNORE_CASE)
-            var match = encodedFilenameRegEx.find(disposition)
-            if (match != null && match.groupValues[1].isNotEmpty() && match.groupValues[3].isNotEmpty()) {
-                try {
-                    val suggestedFilename = if (match.groupValues[1].uppercase() == "UTF-8") {
-                        URLDecoder.decode(match.groupValues[3], "UTF-8")
-                    } else {
-                        match.groupValues[3]
-                    }
-                    return suggestedFilename
-                } catch (_: IllegalArgumentException) {
-                    Log.d(
-                        TAG,
-                        "Could not interpret suggested filename (UTF-8 url encoded) ${match.groupValues[3]}"
-                    )
-                }
-            }
-            // Try filename="filename"
-            val plainFilenameRegEx =
-                Regex("""filename=\s*"?([^"]+)"?.*$""", RegexOption.IGNORE_CASE)
-            match = plainFilenameRegEx.find(disposition)
-            if (match != null && match.groupValues[1].isNotEmpty()) {
-                return match.groupValues[1]
-            }
-        }
-    } catch (_: Throwable) {
+    val disposition = headerValue(responseHeaders, "Content-Disposition")
+    val filename = disposition?.let { filenameFromContentDisposition(it) }
+    if (!filename.isNullOrEmpty()) {
+        return filename
     }
     // Try filename derived from last path segment of the url
     try {
@@ -272,6 +251,83 @@ fun suggestFilename(responseHeaders: Map<String, List<String>>, url: String): St
     }
     return "" // Default fallback
 }
+
+fun filenameFromContentDisposition(disposition: String): String? {
+    val parameters = contentDispositionParameters(disposition)
+    val encodedFilename = parameters["filename*"]
+    if (encodedFilename != null) {
+        val decoded = decodeExtendedFilename(encodedFilename)
+        if (!decoded.isNullOrEmpty()) return decoded
+    }
+    return parameters["filename"]
+}
+
+private fun decodeExtendedFilename(value: String): String? {
+    val firstQuote = value.indexOf('\'')
+    if (firstQuote < 0) return value
+    val secondQuote = value.indexOf('\'', firstQuote + 1)
+    if (secondQuote < 0) return value
+    val charset = value.substring(0, firstQuote).uppercase()
+    val encoded = value.substring(secondQuote + 1)
+    if (charset != "UTF-8") return encoded
+    return try {
+        Uri.decode(encoded)
+    } catch (_: Exception) {
+        Log.d(TAG, "Could not interpret suggested filename (UTF-8 url encoded) $encoded")
+        null
+    }
+}
+
+private fun contentDispositionParameters(disposition: String): Map<String, String> {
+    val parameters = mutableMapOf<String, String>()
+    for (segment in splitContentDisposition(disposition).drop(1)) {
+        val equalsIndex = segment.indexOf('=')
+        if (equalsIndex <= 0) continue
+        val key = segment.substring(0, equalsIndex).trim().lowercase()
+        val value = unquoteHeaderValue(segment.substring(equalsIndex + 1).trim())
+        if (key.isNotEmpty() && value.isNotEmpty()) parameters[key] = value
+    }
+    return parameters
+}
+
+private fun splitContentDisposition(value: String): List<String> {
+    val segments = mutableListOf<String>()
+    val current = StringBuilder()
+    var inQuotes = false
+    var escaped = false
+    for (char in value) {
+        if (escaped) {
+            current.append(char)
+            escaped = false
+            continue
+        }
+        if (char == '\\' && inQuotes) {
+            escaped = true
+            current.append(char)
+            continue
+        }
+        if (char == '"') {
+            inQuotes = !inQuotes
+            current.append(char)
+            continue
+        }
+        if (char == ';' && !inQuotes) {
+            segments.add(current.toString().trim())
+            current.clear()
+            continue
+        }
+        current.append(char)
+    }
+    segments.add(current.toString().trim())
+    return segments
+}
+
+private fun unquoteHeaderValue(value: String): String =
+    if (value.length >= 2 && value.startsWith('"') && value.endsWith('"')) {
+        value.substring(1, value.length - 1)
+            .replace("\\\"", "\"")
+            .replace("\\\\", "\\")
+    } else value
 
 /**
  * Returns the filename from the given [uri]

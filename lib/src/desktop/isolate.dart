@@ -265,37 +265,15 @@ Future<TaskStatus> transferBytes(
 
 /// Processes a change in status for the [task]
 ///
-/// Sends status update via the [sendPort], if requested
-/// If the task is finished, processes a final progressUpdate update
+/// Sends status update via the [sendPort]. Final progress is synthesized in
+/// [BaseDownloader.processStatusUpdate] on the main isolate.
 void processStatusUpdateInIsolate(
   Task task,
   TaskStatus status,
   SendPort sendPort,
 ) {
   final retryNeeded = status == TaskStatus.failed && task.retriesRemaining > 0;
-  // if task is in final state, process a final progressUpdate
-  // A 'failed' progress update is only provided if
-  // a retry is not needed: if it is needed, a `waitingToRetry` progress update
-  // will be generated in the FileDownloader
-  switch (status) {
-    case .complete:
-      processProgressUpdateInIsolate(task, progressComplete, sendPort);
 
-    case .failed when !retryNeeded:
-      processProgressUpdateInIsolate(task, progressFailed, sendPort);
-
-    case .canceled:
-      processProgressUpdateInIsolate(task, progressCanceled, sendPort);
-
-    case .notFound:
-      processProgressUpdateInIsolate(task, progressNotFound, sendPort);
-
-    case .paused:
-      processProgressUpdateInIsolate(task, progressPaused, sendPort);
-
-    default:
-      {}
-  }
   final statusUpdate = TaskStatusUpdate(
     task,
     status,
@@ -308,21 +286,18 @@ void processStatusUpdateInIsolate(
     status.isFinalState ? mimeType : null,
     status.isFinalState ? charSet : null,
   );
-  // Post update if task expects one, or if failed and retry is needed
-  if (task.providesStatusUpdates || retryNeeded) {
-    sendPort.send((
-      'statusUpdate',
-      statusUpdate.task,
-      statusUpdate.status,
-      statusUpdate.exception,
-      statusUpdate.responseBody,
-      statusUpdate.responseHeaders,
-      statusUpdate.responseStatusCode,
-      statusUpdate.mimeType,
-      statusUpdate.charSet,
-    ));
-  }
-  if (status.isFinalState) {
+  sendPort.send((
+    'statusUpdate',
+    statusUpdate.task,
+    statusUpdate.status,
+    statusUpdate.exception,
+    statusUpdate.responseBody,
+    statusUpdate.responseHeaders,
+    statusUpdate.responseStatusCode,
+    statusUpdate.mimeType,
+    statusUpdate.charSet,
+  ));
+  if (status.isFinalState && !retryNeeded) {
     task.options?.onTaskFinishedCallBack?.call(statusUpdate);
   }
 }

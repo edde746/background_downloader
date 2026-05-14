@@ -1,9 +1,7 @@
 package com.bbflight.background_downloader
 
-import android.content.Context
 import android.net.Uri
 import android.os.Build
-import android.os.storage.StorageManager
 import android.util.Log
 import androidx.core.net.toFile
 import androidx.documentfile.provider.DocumentFile
@@ -145,47 +143,23 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
             val contentLength = getContentLength(connection.headerFields, task)
             // determine tempFile, or set to null if Uri is used
             val tempFile = if (!usesUri) {
-                val applicationSupportPath =
-                    baseDirPath(context.appContext, BaseDirectory.applicationSupport)
-                val cachePath = baseDirPath(context.appContext, BaseDirectory.temporary)
-                if (applicationSupportPath == null || cachePath == null) {
-                    throw IllegalStateException("External storage is requested but not available")
+                tempFilePath = if (isResume) {
+                    tempFilePath.ifEmpty { "$destFilePath.part" }
+                } else {
+                    "$destFilePath.part"
                 }
                 val sharedPrefs = PreferenceManager.getDefaultSharedPreferences(context.appContext)
                 val tempFilePathConfig = sharedPrefs.getString(BDPlugin.keyConfigTempFilePath, null)
-                val tempDir = if (!tempFilePathConfig.isNullOrEmpty()) {
-                    File(tempFilePathConfig)
-                } else {
-                    when (sharedPrefs.getInt(BDPlugin.keyConfigUseCacheDir, -2)) {
-                        0 -> File(cachePath) // 'always'
-                        -1 -> File(applicationSupportPath) // 'never'
-                        else -> {
-                            // 'whenAble' -> determine based on cache quota
-                            val storageManager =
-                                context.appContext.getSystemService(Context.STORAGE_SERVICE) as StorageManager
-                            val cacheQuota = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                                storageManager.getCacheQuotaBytes(
-                                    storageManager.getUuidForPath(
-                                        File(cachePath)
-                                    )
-                                )
-                            } else {
-                                50L shl (20)  // for older OS versions, assume 50MB
-                            }
-                            if (contentLength < cacheQuota / 2) File(cachePath) else File(
-                                applicationSupportPath
-                            )
-                        }
-                    }
+                if (!tempFilePathConfig.isNullOrEmpty() && !isResume) {
+                    // Config.tempFilePath override: keep the deterministic
+                    // .part filename but place it in the configured directory
+                    tempFilePath = File(tempFilePathConfig, File(tempFilePath).name).absolutePath
                 }
-                if (!tempDir.exists()) {
-                    tempDir.mkdirs()
-                }
-                tempFilePath =
-                    tempFilePath.ifEmpty { "${tempDir.absolutePath}/com.bbflight.background_downloader${Random.nextInt()}" }
+                val tempFile = File(tempFilePath)
+                tempFile.parentFile?.mkdirs()
 
                 // confirm enough storage space for download
-                if (insufficientSpace(context.appContext, contentLength)) {
+                if (insufficientSpace(context.appContext, contentLength, tempFile)) {
                     Log.i(
                         TAG,
                         "Insufficient space to store the file to be downloaded for taskId ${task.taskId}"
@@ -196,7 +170,7 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
                     )
                     return TaskStatus.failed
                 }
-                File(tempFilePath)
+                tempFile
             } else {
                 null
             }
@@ -292,24 +266,28 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
                             dir.mkdirs()
                         }
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                            withContext(Dispatchers.IO) {
-                                try {
+                            try {
+                                withContext(Dispatchers.IO) {
                                     Files.move(
                                         tempFile.toPath(),
                                         destFile.toPath(),
                                         StandardCopyOption.REPLACE_EXISTING
                                     )
-                                } catch (e: java.nio.file.FileSystemException) {
-                                    // Fallback if moving across different filesystems/mount points (EXDEV / Cross-device link)
-                                    Log.d(TAG, "Files.move failed ($e), falling back to copyTo + delete")
-                                    tempFile.copyTo(destFile, overwrite = true)
-                                    deleteTempFile()
                                 }
+                            } catch (e: IOException) {
+                                Log.i(TAG, "Rename failed; copying temp file instead: ${e.message}")
+                                tempFile.copyTo(destFile, overwrite = true)
+                                deleteTempFile()
                             }
                             setFileOwnership(destFile)
                         } else {
-                            tempFile.copyTo(destFile, overwrite = true)
-                            deleteTempFile()
+                            if (destFile.exists()) {
+                                destFile.delete()
+                            }
+                            if (!tempFile.renameTo(destFile)) {
+                                tempFile.copyTo(destFile, overwrite = true)
+                                deleteTempFile()
+                            }
                             setFileOwnership(destFile)
                         }
                         Log.i(

@@ -114,8 +114,12 @@ void main() {
         activeTasks: [activeTask, replacementActiveTask],
       );
 
-      final expectedDeleted =
-          Platform.isWindows || Platform.isMacOS || Platform.isLinux ? 1 : 0;
+      final expectedDeleted = Platform.isAndroid ||
+              Platform.isWindows ||
+              Platform.isMacOS ||
+              Platform.isLinux
+          ? 1
+          : 0;
       expect(deleted, expectedDeleted);
       expect(
         await orphanPart.exists(),
