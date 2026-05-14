@@ -1,14 +1,13 @@
 import 'dart:async';
 import 'dart:io';
 import 'dart:isolate';
-import 'dart:math';
 
 import 'package:http/http.dart' as http;
 import 'package:path/path.dart' as p;
-import 'package:path_provider/path_provider.dart';
 
 import '../exceptions.dart';
 import '../models.dart';
+import '../resume_data_cleanup.dart';
 import '../task.dart';
 import '../utils.dart';
 import 'desktop_downloader.dart';
@@ -35,18 +34,20 @@ Future<void> doDownloadTask(
   downloadTask = task;
   var filePath = await downloadTask.filePath();
   // tempFilePath is taken from [resumeDataString] if this is a resuming task.
-  // Otherwise, it is a generated full path to the temp directory
-  final tempFilePath = isResume && resumeData != null
+  // Otherwise, use a destination-local .part file to avoid cross-disk copies
+  // and random orphan files after process interruption.
+  var tempFilePath = isResume && resumeData != null
       ? resumeData.tempFilepath
-      : p.join(
-          tempFilePathConfig ?? (await getTemporaryDirectory()).path,
-          'com.bbflight.background_downloader${Random().nextInt(1 << 32).toString()}',
-        );
+      : tempFilePathConfig != null
+          ? p.join(
+              tempFilePathConfig,
+              p.basename(partialDownloadFilePath(filePath)),
+            )
+          : partialDownloadFilePath(filePath);
   final requiredStartByte =
       resumeData?.requiredStartByte ?? 0; // start for resume
   final eTag = resumeData?.eTag;
-  isResume =
-      isResume &&
+  isResume = isResume &&
       await determineIfResumeIsPossible(tempFilePath, requiredStartByte);
   final client = DesktopDownloader.httpClientForUrl(downloadTask.url);
   final request = http.Request(
@@ -93,6 +94,9 @@ Future<void> doDownloadTask(
         );
         // update the filePath by replacing the last segment with the new filename
         filePath = p.join(p.dirname(filePath), downloadTask.filename);
+        if (!isResume) {
+          tempFilePath = partialDownloadFilePath(filePath);
+        }
         log.finest(
           'Suggested filename for taskId ${task.taskId}: ${task.filename}',
         );
@@ -161,7 +165,7 @@ Future<bool> determineIfResumeIsPossible(
 ///
 /// Performs the actual bytes transfer from response to a temp file,
 /// and handles the result of the transfer:
-/// - .complete -> copy temp to final file location
+/// - .complete -> rename temp to final file location
 /// - .failed -> delete temp file
 /// - .paused -> post resume information
 Future<TaskStatus> processOkDownloadResponse(
@@ -217,11 +221,13 @@ Future<TaskStatus> processOkDownloadResponse(
     );
     switch (transferBytesResult) {
       case .complete:
-        // copy file to destination, creating dirs if needed
+        // rename file to destination, creating dirs if needed
         await outStream.flush();
+        await outStream.close();
+        outStream = null;
         final dirPath = p.dirname(filePath);
         Directory(dirPath).createSync(recursive: true);
-        File(actualTempFilePath).copySync(filePath);
+        moveTempFileToDestination(actualTempFilePath, filePath);
         resultStatus = TaskStatus.complete;
 
       case .canceled:
@@ -268,8 +274,9 @@ Future<TaskStatus> processOkDownloadResponse(
           bytesTotal + startByte,
           eTagHeader,
         ));
-      } else if (resultStatus != TaskStatus.paused) {
-        File(actualTempFilePath).deleteSync();
+      } else if (resultStatus != TaskStatus.paused &&
+          resultStatus != TaskStatus.complete) {
+        deleteTempFile(actualTempFilePath);
       }
     } catch (e) {
       logError(
@@ -335,10 +342,26 @@ Future<bool> prepareResume(
   return true;
 }
 
-/// Delete the temporary file
-void deleteTempFile(String tempFilePath) async {
+/// Move the temporary file to the final destination.
+void moveTempFileToDestination(String tempFilePath, String filePath) {
+  final destination = File(filePath);
+  if (destination.existsSync()) {
+    destination.deleteSync();
+  }
   try {
+    File(tempFilePath).renameSync(filePath);
+  } on FileSystemException {
+    // cross-device move (e.g. Config.tempFilePath on another volume)
+    File(tempFilePath).copySync(filePath);
     File(tempFilePath).deleteSync();
+  }
+}
+
+/// Delete the temporary file
+void deleteTempFile(String tempFilePath) {
+  try {
+    final file = File(tempFilePath);
+    if (file.existsSync()) file.deleteSync();
   } on FileSystemException {
     log.fine('Could not delete temp file $tempFilePath');
   }
