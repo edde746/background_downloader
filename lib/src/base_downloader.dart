@@ -791,6 +791,13 @@ abstract base class BaseDownloader {
     }
   }
 
+  /// Remove orphaned temporary files created by older downloader versions.
+  Future<int> cleanUpOrphanedTempFiles() async {
+    await ready;
+    final resumeData = await _storage.retrieveAllResumeData();
+    return deleteOrphanedLegacyDesktopTempFiles(resumeData, log: log);
+  }
+
   /// Store the paused [task]
   Future<void> setPausedTask(Task task) => _storage.storePausedTask(task);
 

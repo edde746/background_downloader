@@ -2,12 +2,18 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:logging/logging.dart';
+import 'package:path/path.dart' as p;
+import 'package:path_provider/path_provider.dart';
 
 import 'chunk.dart';
 import 'models.dart';
 import 'task.dart';
 
 final _windowsAbsolutePathRegExp = RegExp(r'^[a-zA-Z]:[\\/]');
+const _legacyDesktopTempFilePrefix = 'com.bbflight.background_downloader';
+
+/// Returns the destination-local temporary file path for a desktop download.
+String partialDownloadFilePath(String filePath) => '$filePath.part';
 
 /// Deletes temporary files referenced by [resumeData].
 ///
@@ -106,6 +112,47 @@ Future<bool> deleteResumeDataTempFile(String value, {Logger? log}) async {
   return false;
 }
 
+/// Deletes old random Windows temp files that are no longer referenced by
+/// stored resume data.
+///
+/// Desktop downloads now use destination-local `.part` files. This only cleans
+/// up files created by older versions in `%TEMP%` with the legacy random prefix.
+Future<int> deleteOrphanedLegacyDesktopTempFiles(
+  Iterable<ResumeData> allResumeData, {
+  Directory? temporaryDirectory,
+  Logger? log,
+}) async {
+  if (!Platform.isWindows) return 0;
+
+  final tempDir = temporaryDirectory ?? await getTemporaryDirectory();
+  if (!await tempDir.exists()) return 0;
+
+  final referencedPaths = <String>{};
+  for (final resumeData in allResumeData) {
+    if (resumeData.task is ParallelDownloadTask) continue;
+    final filePath = _filePathFromResumeData(resumeData.data);
+    if (filePath != null) referencedPaths.add(_pathKey(filePath));
+  }
+
+  var deleted = 0;
+  await for (final entity in tempDir.list()) {
+    if (entity is! File) continue;
+    if (!p.basename(entity.path).startsWith(_legacyDesktopTempFilePrefix)) {
+      continue;
+    }
+    if (referencedPaths.contains(_pathKey(entity.path))) continue;
+    try {
+      await entity.delete();
+      deleted++;
+      log?.fine('Deleted orphaned legacy temp file ${entity.path}');
+    } on FileSystemException catch (e) {
+      log?.fine(
+          'Could not delete orphaned legacy temp file ${entity.path}: $e');
+    }
+  }
+  return deleted;
+}
+
 String? _filePathFromResumeData(String value) {
   if (value.isEmpty) return null;
   if (Platform.isWindows && _windowsAbsolutePathRegExp.hasMatch(value)) {
@@ -114,4 +161,9 @@ String? _filePathFromResumeData(String value) {
   final uri = Uri.tryParse(value);
   if (uri != null && uri.hasScheme) return null;
   return value;
+}
+
+String _pathKey(String filePath) {
+  final normalized = p.normalize(File(filePath).absolute.path);
+  return Platform.isWindows ? normalized.toLowerCase() : normalized;
 }

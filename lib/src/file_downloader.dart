@@ -639,6 +639,13 @@ interface class FileDownloader {
   Future<void> resumeFromBackground() =>
       _downloader.retrieveLocallyStoredData();
 
+  /// Deletes orphaned temporary files created by older downloader versions.
+  ///
+  /// This currently only affects legacy random temp files on Windows. Active
+  /// or resumable files referenced by stored resume data are preserved.
+  Future<int> cleanUpOrphanedTempFiles() =>
+      _downloader.cleanUpOrphanedTempFiles();
+
   /// Reschedules tasks that are present in the database but missing from
   /// the native task queue. Typically called on app start, 5s after establishing
   /// the updates listener, calling [trackTasks] or [trackTasksInGroup] and
