@@ -127,7 +127,107 @@ void main() {
       expect(await targetFile.exists(), isTrue);
       expect(await storage.retrieveResumeData(task.taskId), isNull);
     });
+
+    test('cleanUp by age preserves active records', () async {
+      final oldCreationTime = DateTime.now().subtract(
+        const Duration(days: 20),
+      );
+      final runningTask = defaultTask.copyWith(
+        taskId: 'old-running-task',
+        creationTime: oldCreationTime,
+      );
+      final waitingTask = defaultTask.copyWith(
+        taskId: 'old-waiting-task',
+        creationTime: oldCreationTime,
+      );
+      final failedTask = defaultTask.copyWith(
+        taskId: 'old-failed-task',
+        creationTime: oldCreationTime,
+      );
+
+      await storage.storeTaskRecord(
+        TaskRecord(runningTask, TaskStatus.running, 0.0, -1),
+      );
+      await storage.storeTaskRecord(
+        TaskRecord(waitingTask, TaskStatus.waitingToRetry, 0.0, -1),
+      );
+      await storage.storeTaskRecord(
+        TaskRecord(failedTask, TaskStatus.failed, progressFailed, -1),
+      );
+
+      db.cleanUp(
+        maxAge: const Duration(days: 10),
+        maxRecordCount: null,
+        autoClean: false,
+      );
+
+      await _waitUntil(
+        () async => await storage.retrieveTaskRecord(failedTask.taskId) == null,
+      );
+      expect(await storage.retrieveTaskRecord(runningTask.taskId), isNotNull);
+      expect(await storage.retrieveTaskRecord(waitingTask.taskId), isNotNull);
+    });
+
+    test('cleanUp by count preserves active records', () async {
+      final now = DateTime.now();
+      final runningTask = defaultTask.copyWith(
+        taskId: 'count-running-task',
+        creationTime: now.subtract(const Duration(days: 5)),
+      );
+      final enqueuedTask = defaultTask.copyWith(
+        taskId: 'count-enqueued-task',
+        creationTime: now.subtract(const Duration(days: 4)),
+      );
+      final waitingTask = defaultTask.copyWith(
+        taskId: 'count-waiting-task',
+        creationTime: now.subtract(const Duration(days: 3)),
+      );
+      final failedTask = defaultTask.copyWith(
+        taskId: 'count-failed-task',
+        creationTime: now.subtract(const Duration(days: 2)),
+      );
+      final completeTask = defaultTask.copyWith(
+        taskId: 'count-complete-task',
+        creationTime: now.subtract(const Duration(days: 1)),
+      );
+
+      await storage.storeTaskRecord(
+        TaskRecord(runningTask, TaskStatus.running, 0.0, -1),
+      );
+      await storage.storeTaskRecord(
+        TaskRecord(enqueuedTask, TaskStatus.enqueued, 0.0, -1),
+      );
+      await storage.storeTaskRecord(
+        TaskRecord(waitingTask, TaskStatus.waitingToRetry, 0.0, -1),
+      );
+      await storage.storeTaskRecord(
+        TaskRecord(failedTask, TaskStatus.failed, progressFailed, -1),
+      );
+      await storage.storeTaskRecord(
+        TaskRecord(completeTask, TaskStatus.complete, progressComplete, -1),
+      );
+
+      db.cleanUp(maxRecordCount: 2, maxAge: null, autoClean: false);
+
+      await _waitUntil(() async {
+        return await storage.retrieveTaskRecord(failedTask.taskId) == null &&
+            await storage.retrieveTaskRecord(completeTask.taskId) == null;
+      });
+      expect(await storage.retrieveTaskRecord(runningTask.taskId), isNotNull);
+      expect(await storage.retrieveTaskRecord(enqueuedTask.taskId), isNotNull);
+      expect(await storage.retrieveTaskRecord(waitingTask.taskId), isNotNull);
+      expect(await storage.retrieveAllTaskRecords(), hasLength(3));
+    });
   });
+}
+
+Future<void> _waitUntil(Future<bool> Function() condition) async {
+  final deadline = DateTime.now().add(const Duration(seconds: 3));
+  while (DateTime.now().isBefore(deadline)) {
+    if (await condition()) return;
+    await Future.delayed(const Duration(milliseconds: 20));
+  }
+  fail('Timed out waiting for condition');
 }
 
 class MockPersistentStorage implements PersistentStorage {

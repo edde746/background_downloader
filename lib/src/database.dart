@@ -223,12 +223,15 @@ interface class Database {
 
         final recordsToDelete = <TaskRecord>{};
         final now = DateTime.now();
-        // Check age
+        // Check age. Active records must survive cleanup so killed-task
+        // recovery and retry tracking remain possible.
         if (_maxAge != null) {
           final maxAge = _maxAge!;
           recordsToDelete.addAll(
             allRecords.where(
-              (record) => now.difference(record.task.creationTime) > maxAge,
+              (record) =>
+                  record.status.isFinalState &&
+                  now.difference(record.task.creationTime) > maxAge,
             ),
           );
         }
@@ -236,9 +239,21 @@ interface class Database {
         if (_maxRecordCount != null) {
           final count = _maxRecordCount!;
           if (allRecords.length > count) {
-            // Because we sorted newly created first, the ones after 'count' are the oldest
-            final recordsBeyondCount = allRecords.skip(count);
-            recordsToDelete.addAll(recordsBeyondCount);
+            var recordsNeededToDelete = allRecords.length - count;
+            recordsNeededToDelete -= recordsToDelete.length;
+            if (recordsNeededToDelete > 0) {
+              // Because we sorted newly created first, iterate from the end to
+              // delete the oldest final-state records first.
+              for (final record in allRecords.reversed) {
+                if (recordsNeededToDelete == 0) break;
+                if (!record.status.isFinalState ||
+                    recordsToDelete.contains(record)) {
+                  continue;
+                }
+                recordsToDelete.add(record);
+                recordsNeededToDelete--;
+              }
+            }
           }
         }
         _log.finest(

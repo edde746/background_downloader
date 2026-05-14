@@ -639,11 +639,11 @@ interface class FileDownloader {
   Future<void> resumeFromBackground() =>
       _downloader.retrieveLocallyStoredData();
 
-  /// Deletes orphaned temporary files created by older downloader versions.
+  /// Deletes orphaned temporary files from interrupted downloads.
   ///
-  /// This currently only affects legacy random temp files on desktop and
-  /// Android. Active or resumable files referenced by stored resume data are
-  /// preserved.
+  /// This affects legacy random temp files on desktop and Android, and tracked
+  /// destination-local `.part` files on desktop. Active or resumable files
+  /// referenced by stored resume data are preserved.
   Future<int> cleanUpOrphanedTempFiles() =>
       _downloader.cleanUpOrphanedTempFiles();
 

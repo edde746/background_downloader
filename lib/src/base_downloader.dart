@@ -791,29 +791,47 @@ abstract base class BaseDownloader {
     }
   }
 
-  /// Remove orphaned temporary files created by older downloader versions.
+  /// Remove orphaned temporary files from interrupted downloads.
   Future<int> cleanUpOrphanedTempFiles() async {
     await ready;
-    if (Platform.isAndroid) {
+    final isDesktop =
+        Platform.isWindows || Platform.isMacOS || Platform.isLinux;
+    var activeTasks = <Task>[];
+    if (Platform.isAndroid || isDesktop) {
       try {
-        final activeTasks = await allTasks(
+        activeTasks = await allTasks(
           FileDownloader.defaultGroup,
           true,
           true,
         );
         if (activeTasks.isNotEmpty) {
-          log.fine(
-            'Skipping orphaned temp cleanup: ${activeTasks.length} active Android task(s)',
-          );
-          return 0;
+          if (Platform.isAndroid) {
+            log.fine(
+              'Skipping orphaned temp cleanup: ${activeTasks.length} active Android task(s)',
+            );
+            return 0;
+          }
         }
       } catch (e) {
-        log.fine('Skipping Android orphaned temp cleanup: $e');
-        return 0;
+        if (Platform.isAndroid) {
+          log.fine('Skipping Android orphaned temp cleanup: $e');
+          return 0;
+        }
+        log.fine('Could not retrieve active tasks for temp cleanup: $e');
       }
     }
     final resumeData = await _storage.retrieveAllResumeData();
-    return deleteOrphanedLegacyTempFiles(resumeData, log: log);
+    var deleted = await deleteOrphanedLegacyTempFiles(resumeData, log: log);
+    if (isDesktop) {
+      final records = await database.allRecords();
+      deleted += await deleteOrphanedPartialDownloadFiles(
+        trackedTasks: records.map((record) => record.task),
+        allResumeData: resumeData,
+        activeTasks: activeTasks,
+        log: log,
+      );
+    }
+    return deleted;
   }
 
   /// Store the paused [task]

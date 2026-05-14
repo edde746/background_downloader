@@ -127,12 +127,7 @@ Future<int> deleteOrphanedLegacyTempFiles(
       await _defaultLegacyTempDirectories();
   if (scanDirectories.isEmpty) return 0;
 
-  final referencedPaths = <String>{};
-  for (final resumeData in allResumeData) {
-    if (resumeData.task is ParallelDownloadTask) continue;
-    final filePath = _filePathFromResumeData(resumeData.data);
-    if (filePath != null) referencedPaths.add(_pathKey(filePath));
-  }
+  final referencedPaths = _referencedResumePathKeys(allResumeData);
 
   var deleted = 0;
   final scannedPathKeys = <String>{};
@@ -160,6 +155,56 @@ Future<int> deleteOrphanedLegacyTempFiles(
   return deleted;
 }
 
+/// Deletes destination-local `.part` files left behind by interrupted desktop
+/// downloads.
+///
+/// Only paths derived from [trackedTasks] are considered. Files referenced by
+/// stored resume data or belonging to [activeTasks] are preserved.
+Future<int> deleteOrphanedPartialDownloadFiles({
+  required Iterable<Task> trackedTasks,
+  required Iterable<ResumeData> allResumeData,
+  required Iterable<Task> activeTasks,
+  Logger? log,
+}) async {
+  if (!_isDesktop) return 0;
+
+  final referencedPaths = _referencedResumePathKeys(allResumeData);
+  final activeTaskIds = activeTasks.map((task) => task.taskId).toSet();
+  final activePartPathKeys = <String>{};
+  for (final task in activeTasks) {
+    if (task is! DownloadTask || task is UriDownloadTask) continue;
+    final activePartFilePath = await _partialFilePathForTask(task, log: log);
+    if (activePartFilePath != null) {
+      activePartPathKeys.add(_pathKey(activePartFilePath));
+    }
+  }
+  final scannedPathKeys = <String>{};
+  var deleted = 0;
+
+  for (final task in trackedTasks) {
+    if (task is! DownloadTask || task is UriDownloadTask) continue;
+    if (activeTaskIds.contains(task.taskId)) continue;
+    final partFilePath = await _partialFilePathForTask(task, log: log);
+    if (partFilePath == null) continue;
+    final pathKey = _pathKey(partFilePath);
+    if (!scannedPathKeys.add(pathKey)) continue;
+    if (activePartPathKeys.contains(pathKey)) continue;
+    if (referencedPaths.contains(pathKey)) continue;
+
+    final file = File(partFilePath);
+    try {
+      if (await file.exists()) {
+        await file.delete();
+        deleted++;
+        log?.fine('Deleted orphaned partial download file $partFilePath');
+      }
+    } on FileSystemException catch (e) {
+      log?.fine('Could not delete partial download file $partFilePath: $e');
+    }
+  }
+  return deleted;
+}
+
 Future<List<Directory>> _defaultLegacyTempDirectories() async {
   if (Platform.isWindows || Platform.isMacOS || Platform.isLinux) {
     return [await getTemporaryDirectory()];
@@ -181,6 +226,29 @@ Future<List<Directory>> _defaultLegacyTempDirectories() async {
   }
   return directories;
 }
+
+Set<String> _referencedResumePathKeys(Iterable<ResumeData> allResumeData) {
+  final referencedPaths = <String>{};
+  for (final resumeData in allResumeData) {
+    if (resumeData.task is ParallelDownloadTask) continue;
+    final filePath = _filePathFromResumeData(resumeData.data);
+    if (filePath != null) referencedPaths.add(_pathKey(filePath));
+  }
+  return referencedPaths;
+}
+
+Future<String?> _partialFilePathForTask(DownloadTask task,
+    {Logger? log}) async {
+  try {
+    return partialDownloadFilePath(await task.filePath());
+  } catch (e) {
+    log?.fine('Could not resolve partial download file for ${task.taskId}: $e');
+    return null;
+  }
+}
+
+bool get _isDesktop =>
+    Platform.isWindows || Platform.isMacOS || Platform.isLinux;
 
 String? _filePathFromResumeData(String value) {
   if (value.isEmpty) return null;

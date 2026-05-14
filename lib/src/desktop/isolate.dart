@@ -46,8 +46,8 @@ final log = Logger('FileDownloader');
 
 /// Do the task, sending messages back to the main isolate via [sendPort]
 ///
-/// The first message sent back is a [ReceivePort] that is the command port
-/// for the isolate. The first command must be the arguments: task and filePath.
+/// The first message sent back is a [ReceivePort] that is the command port for
+/// the isolate. The first command must be the task arguments.
 Future<void> doTask((RootIsolateToken, SendPort) isolateArguments) async {
   final (rootIsolateToken, sendPort) = isolateArguments;
   BackgroundIsolateBinaryMessenger.ensureInitialized(rootIsolateToken);
@@ -63,6 +63,7 @@ Future<void> doTask((RootIsolateToken, SendPort) isolateArguments) async {
     Duration? requestTimeout,
     Map<String, dynamic> proxy,
     bool bypassTLSCertificateValidation,
+    bool initiallyCanceled,
   ) = await messagesToIsolate.next;
   DesktopDownloader.setHttpClient(
     requestTimeout,
@@ -75,6 +76,14 @@ Future<void> doTask((RootIsolateToken, SendPort) isolateArguments) async {
       sendPort.send(('log', (rec.message)));
     }
   });
+  if (initiallyCanceled) {
+    isCanceled = true;
+    processStatusUpdateInIsolate(originalTask, TaskStatus.canceled, sendPort);
+    DesktopDownloader.httpClient.close();
+    receivePort.close();
+    sendPort.send('done');
+    Isolate.exit();
+  }
   // process native callbacks beforeTaskStart, onTaskStart and onAuth
   final statusUpdate = await originalTask.options?.beforeTaskStartCallBack
       ?.call(originalTask);
