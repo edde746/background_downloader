@@ -115,9 +115,8 @@ Future<bool> deleteResumeDataTempFile(String value, {Logger? log}) async {
 /// Deletes old random temp files that are no longer referenced by stored resume
 /// data.
 ///
-/// Desktop downloads now use destination-local `.part` files. Android still
-/// writes temporary files in app-owned cache/support directories. This cleanup
-/// only removes files with the legacy random prefix.
+/// Current desktop and Android downloads use destination-local `.part` files.
+/// This cleanup only removes files with the legacy random prefix.
 Future<int> deleteOrphanedLegacyTempFiles(
   Iterable<ResumeData> allResumeData, {
   Iterable<Directory>? directories,
@@ -155,8 +154,7 @@ Future<int> deleteOrphanedLegacyTempFiles(
   return deleted;
 }
 
-/// Deletes destination-local `.part` files left behind by interrupted desktop
-/// downloads.
+/// Deletes destination-local `.part` files left behind by interrupted downloads.
 ///
 /// Only paths derived from [trackedTasks] are considered. Files referenced by
 /// stored resume data or belonging to [activeTasks] are preserved.
@@ -166,7 +164,7 @@ Future<int> deleteOrphanedPartialDownloadFiles({
   required Iterable<Task> activeTasks,
   Logger? log,
 }) async {
-  if (!_isDesktop) return 0;
+  if (!_supportsPartialDownloadCleanup) return 0;
 
   final referencedPaths = _referencedResumePathKeys(allResumeData);
   final activeTaskIds = activeTasks.map((task) => task.taskId).toSet();
@@ -247,8 +245,11 @@ Future<String?> _partialFilePathForTask(DownloadTask task,
   }
 }
 
-bool get _isDesktop =>
-    Platform.isWindows || Platform.isMacOS || Platform.isLinux;
+bool get _supportsPartialDownloadCleanup =>
+    Platform.isAndroid ||
+    Platform.isWindows ||
+    Platform.isMacOS ||
+    Platform.isLinux;
 
 String? _filePathFromResumeData(String value) {
   if (value.isEmpty) return null;

@@ -133,9 +133,8 @@ open class TaskRunner(
         /**
          * Processes a change in status for the task
          *
-         * Sends status update via the background channel to Flutter, if requested
-         * If the task is finished, processes a final progressUpdate update and removes
-         * task from persistent storage.
+         * Sends status update via the background channel to Flutter. Dart decides
+         * which updates are user-visible and synthesizes terminal progress.
          *
          * Optional [taskException] for status .failed
          * */
@@ -180,39 +179,17 @@ open class TaskRunner(
             val modifiedStatus =
                 if (BDPlugin.canceledTaskIds.contains(task.taskId)) TaskStatus.canceled else status
 
-            // A 'failed' progress update is only provided if
-            // a retry is not needed: if it is needed, a `waitingToRetry` progress update
-            // will be generated on the Dart side
+            // Retry orchestration and final progress are generated on the Dart side.
             val retryNeeded = modifiedStatus == TaskStatus.failed && task.retriesRemaining > 0
             var canSendStatusUpdate = true  // may become false for cancellations
-            // if task is in final state, process a final progressUpdate
             when (modifiedStatus) {
-                TaskStatus.complete -> processProgressUpdate(
-                    task, 1.0, prefs
-                )
-
-                TaskStatus.failed -> if (!retryNeeded) processProgressUpdate(
-                    task, -1.0, prefs
-                )
-
                 TaskStatus.canceled -> {
                     canSendStatusUpdate = canSendCancellation(task)
                     if (canSendStatusUpdate) {
                         BDPlugin.cancelUpdateSentForTaskId[task.taskId] =
                             currentTimeMillis()
-                        processProgressUpdate(
-                            task, -2.0, prefs
-                        )
                     }
                 }
-
-                TaskStatus.notFound -> processProgressUpdate(
-                    task, -3.0, prefs
-                )
-
-                TaskStatus.paused -> processProgressUpdate(
-                    task, -5.0, prefs
-                )
 
                 else -> {}
             }
@@ -242,8 +219,8 @@ open class TaskRunner(
                     charSet = null
                 )
 
-            // Post update if task expects one, or if failed and retry is needed
-            if (canSendStatusUpdate && (task.providesStatusUpdates() || retryNeeded)) {
+            // Dart decides which updates are user-visible and synthesizes terminal progress.
+            if (canSendStatusUpdate) {
                 val arg = taskStatusUpdate.argList
                 postOnBackgroundChannel("statusUpdate", task, arg, onFail = {
                     // unsuccessful post, so store in local prefs
@@ -289,7 +266,7 @@ open class TaskRunner(
                     }
                 }
                 QueueService.cleanupTaskId(task.taskId)
-                if (task.options?.hasOnFinishCallback() == true) {
+                if (!retryNeeded && task.options?.hasOnFinishCallback() == true) {
                     Callbacks.invokeOnTaskFinishedCallback(context, taskStatusUpdate)
                 }
             }
@@ -891,7 +868,7 @@ open class TaskRunner(
      * Extract content type from [headers] and set [mimeType] and [charSet]
      */
     fun extractContentType(headers: MutableMap<String, MutableList<String>>) {
-        val contentType = headers["content-type"]?.first()
+        val contentType = headerValue(headers, "Content-Type")
         if (contentType != null) {
             val regEx = Regex("""(.*);\s*charset\s*=(.*)""")
             val match = regEx.find(contentType)

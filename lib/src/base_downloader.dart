@@ -218,17 +218,17 @@ abstract base class BaseDownloader {
         await setResumeData(resumeData);
         await setPausedTask(resumeData.task);
       }
-      final statusUpdateMap = await popUndeliveredData(
-        Undelivered.statusUpdates,
-      );
-      for (var jsonString in statusUpdateMap.values) {
-        processStatusUpdate(TaskStatusUpdate.fromJsonString(jsonString));
-      }
       final progressUpdateMap = await popUndeliveredData(
         Undelivered.progressUpdates,
       );
       for (var jsonString in progressUpdateMap.values) {
         processProgressUpdate(TaskProgressUpdate.fromJsonString(jsonString));
+      }
+      final statusUpdateMap = await popUndeliveredData(
+        Undelivered.statusUpdates,
+      );
+      for (var jsonString in statusUpdateMap.values) {
+        processStatusUpdate(TaskStatusUpdate.fromJsonString(jsonString));
       }
       retrievedLocallyStoredData = true;
     }
@@ -511,7 +511,6 @@ abstract base class BaseDownloader {
       tasksWaitingToRetry.remove(task);
       _clearPauseResumeInfo(task);
       processStatusUpdate(TaskStatusUpdate(task, TaskStatus.canceled));
-      processProgressUpdate(TaskProgressUpdate(task, progressCanceled));
       updateNotification(task, null); // remove notification
     }
     final remainingTaskIds = taskIds.where(
@@ -567,7 +566,6 @@ abstract base class BaseDownloader {
         await removePausedTask(task.taskId);
         canResumeTask.remove(task);
         processStatusUpdate(TaskStatusUpdate(task, TaskStatus.canceled));
-        processProgressUpdate(TaskProgressUpdate(task, progressCanceled));
         updateNotification(task, TaskStatus.canceled);
       }
     }
@@ -794,10 +792,12 @@ abstract base class BaseDownloader {
   /// Remove orphaned temporary files from interrupted downloads.
   Future<int> cleanUpOrphanedTempFiles() async {
     await ready;
-    final isDesktop =
-        Platform.isWindows || Platform.isMacOS || Platform.isLinux;
+    final supportsPartialCleanup = Platform.isAndroid ||
+        Platform.isWindows ||
+        Platform.isMacOS ||
+        Platform.isLinux;
     var activeTasks = <Task>[];
-    if (Platform.isAndroid || isDesktop) {
+    if (supportsPartialCleanup) {
       try {
         activeTasks = await allTasks(
           FileDownloader.defaultGroup,
@@ -822,7 +822,7 @@ abstract base class BaseDownloader {
     }
     final resumeData = await _storage.retrieveAllResumeData();
     var deleted = await deleteOrphanedLegacyTempFiles(resumeData, log: log);
-    if (isDesktop) {
+    if (supportsPartialCleanup) {
       final records = await database.allRecords();
       deleted += await deleteOrphanedPartialDownloadFiles(
         trackedTasks: records.map((record) => record.task),
@@ -1005,6 +1005,7 @@ abstract base class BaseDownloader {
               'Could not resume/enqueue taskId ${task.taskId} after retry timeout',
             );
             _clearPauseResumeInfo(task);
+            _emitProgressForStatus(task, TaskStatus.failed);
             _emitStatusUpdate(
               TaskStatusUpdate(
                 task,
@@ -1014,12 +1015,12 @@ abstract base class BaseDownloader {
                 ),
               ),
             );
-            _emitProgressUpdate(TaskProgressUpdate(task, progressFailed));
           }
         }
       });
     } else {
       // normal status update
+      _emitProgressForStatus(task, update.status);
       if (update.status == TaskStatus.paused) {
         setPausedTask(task);
       }
@@ -1030,6 +1031,21 @@ abstract base class BaseDownloader {
         notifyTaskQueues(task);
       }
       _emitStatusUpdate(update);
+    }
+  }
+
+  /// Emit final or terminal-like progress implied by [status].
+  void _emitProgressForStatus(Task task, TaskStatus status) {
+    final progress = switch (status) {
+      TaskStatus.complete => progressComplete,
+      TaskStatus.failed => progressFailed,
+      TaskStatus.canceled => progressCanceled,
+      TaskStatus.notFound => progressNotFound,
+      TaskStatus.paused => progressPaused,
+      _ => null,
+    };
+    if (progress != null) {
+      _emitProgressUpdate(TaskProgressUpdate(task, progress));
     }
   }
 

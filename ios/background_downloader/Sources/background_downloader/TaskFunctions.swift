@@ -89,6 +89,29 @@ func stripFileExtension ( _ filename: String ) -> String {
     return components.joined(separator: ".")
 }
 
+func headerValue(responseHeaders: [AnyHashable: Any], name: String) -> String? {
+    for (key, value) in responseHeaders {
+        if String(describing: key).lowercased() == name.lowercased() {
+            if let stringValue = value as? String, !stringValue.isEmpty {
+                return stringValue
+            }
+            if let stringValues = value as? [String] {
+                return stringValues.first(where: { !$0.isEmpty })
+            }
+        }
+    }
+    return nil
+}
+
+func headerValue(headers: [String: String], name: String) -> String? {
+    for (key, value) in headers {
+        if key.lowercased() == name.lowercased() && !value.isEmpty {
+            return value
+        }
+    }
+    return nil
+}
+
 /// Suggests a filename based on response headers and a URL.
 /// If none can be derived, returns an empty string.
 ///
@@ -97,38 +120,10 @@ func stripFileExtension ( _ filename: String ) -> String {
 ///   - urlString: The URL string the file would be downloaded from.
 /// - Returns: A suggested filename, derived from the headers or the URL.
 func suggestFilename(responseHeaders: [AnyHashable: Any], urlString: String) -> String {
-    do {
-        if let disposition = responseHeaders["Content-Disposition"] as? String ?? responseHeaders["content-disposition"] as? String {
-            // Try filename*=UTF-8'language'"encodedFilename"
-            let encodedFilenameRegEx = try NSRegularExpression(pattern: #"filename\*=\s*([^']+)'([^']*)'"?([^"]+)"?"#, options: .caseInsensitive)
-            let range = NSRange(location: 0, length: disposition.utf16.count)
-            if let match = encodedFilenameRegEx.firstMatch(in: disposition, options: [], range: range) {
-                if let encodingRange = Range(match.range(at: 1), in: disposition),
-                   let filenameRange = Range(match.range(at: 3), in: disposition) {
-                    let encoding = String(disposition[encodingRange]).uppercased()
-                    let filename = String(disposition[filenameRange])
-                    if encoding == "UTF-8" {
-                        if let decodedFilename = filename.removingPercentEncoding {
-                            return decodedFilename
-                        } else {
-                            os_log("Could not interpret suggested filename (UTF-8 url encoded) %@", log: log, type: .debug, filename)
-                        }
-                    } else {
-                        return filename
-                    }
-                }
-            }
-
-            // Try filename="filename"
-            let plainFilenameRegEx = try NSRegularExpression(pattern: #"filename=\s*"?([^"]+)"?.*$"#, options: .caseInsensitive)
-            if let match = plainFilenameRegEx.firstMatch(in: disposition, options: [], range: range) {
-                if let filenameRange = Range(match.range(at: 1), in: disposition) {
-                    return String(disposition[filenameRange])
-                }
-            }
-        }
-    } catch {
-        os_log("Error parsing suggested filename from headers: %@", log: log, type: .error, error.localizedDescription)
+    if let disposition = headerValue(responseHeaders: responseHeaders, name: "Content-Disposition"),
+       let filename = filenameFromContentDisposition(disposition),
+       !filename.isEmpty {
+        return filename
     }
 
     os_log("Could not determine suggested filename from server", log: log, type: .debug)
@@ -140,6 +135,86 @@ func suggestFilename(responseHeaders: [AnyHashable: Any], urlString: String) -> 
 
     os_log("Could not parse URL pathSegment for suggested filename", log: log, type: .debug)
     return "" // Default fallback
+}
+
+func filenameFromContentDisposition(_ disposition: String) -> String? {
+    let parameters = contentDispositionParameters(disposition)
+    if let encodedFilename = parameters["filename*"],
+       let decoded = decodeExtendedFilename(encodedFilename),
+       !decoded.isEmpty {
+        return decoded
+    }
+    return parameters["filename"]
+}
+
+private func decodeExtendedFilename(_ value: String) -> String? {
+    guard let firstQuote = value.firstIndex(of: "'") else { return value }
+    guard let secondQuote = value[value.index(after: firstQuote)...].firstIndex(of: "'") else { return value }
+    let charset = String(value[..<firstQuote]).uppercased()
+    let encoded = String(value[value.index(after: secondQuote)...])
+    if charset != "UTF-8" { return encoded }
+    if let decoded = encoded.removingPercentEncoding {
+        return decoded
+    }
+    os_log("Could not interpret suggested filename (UTF-8 url encoded) %@", log: log, type: .debug, encoded)
+    return nil
+}
+
+private func contentDispositionParameters(_ disposition: String) -> [String: String] {
+    var parameters: [String: String] = [:]
+    for segment in splitContentDisposition(disposition).dropFirst() {
+        guard let equalsIndex = segment.firstIndex(of: "=") else { continue }
+        let key = segment[..<equalsIndex].trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let valueStart = segment.index(after: equalsIndex)
+        let value = unquoteHeaderValue(String(segment[valueStart...]).trimmingCharacters(in: .whitespacesAndNewlines))
+        if !key.isEmpty && !value.isEmpty {
+            parameters[key] = value
+        }
+    }
+    return parameters
+}
+
+private func splitContentDisposition(_ value: String) -> [String] {
+    var segments: [String] = []
+    var current = ""
+    var inQuotes = false
+    var escaped = false
+    for char in value {
+        if escaped {
+            current.append(char)
+            escaped = false
+            continue
+        }
+        if char == "\\" && inQuotes {
+            escaped = true
+            current.append(char)
+            continue
+        }
+        if char == "\"" {
+            inQuotes.toggle()
+            current.append(char)
+            continue
+        }
+        if char == ";" && !inQuotes {
+            segments.append(current.trimmingCharacters(in: .whitespacesAndNewlines))
+            current = ""
+            continue
+        }
+        current.append(char)
+    }
+    segments.append(current.trimmingCharacters(in: .whitespacesAndNewlines))
+    return segments
+}
+
+private func unquoteHeaderValue(_ value: String) -> String {
+    if value.count >= 2 && value.hasPrefix("\"") && value.hasSuffix("\"") {
+        let start = value.index(after: value.startIndex)
+        let end = value.index(before: value.endIndex)
+        return String(value[start..<end])
+            .replacingOccurrences(of: "\\\"", with: "\"")
+            .replacingOccurrences(of: "\\\\", with: "\\")
+    }
+    return value
 }
 
 /**
@@ -222,9 +297,11 @@ func parseRange(rangeStr: String) -> (Int64, Int64?) {
     let regex = try! NSRegularExpression(pattern: #"bytes=(\d*)-(\d*)"#)
     let range = NSMakeRange(0, rangeStr.utf16.count)
     if let match = regex.firstMatch(in: rangeStr, options: [], range: range) {
-        let start = Int64(String(rangeStr[Range(match.range(at: 1), in: rangeStr)!]))
-        let end = Int64(String(rangeStr[Range(match.range(at: 2), in: rangeStr)!]))
-        return (start!, end!)
+        let startString = String(rangeStr[Range(match.range(at: 1), in: rangeStr)!])
+        let endString = String(rangeStr[Range(match.range(at: 2), in: rangeStr)!])
+        let start = Int64(startString) ?? 0
+        let end = endString.isEmpty ? nil : Int64(endString)
+        return (start, end)
     } else {
         return (0, nil)
     }
@@ -233,20 +310,20 @@ func parseRange(rangeStr: String) -> (Int64, Int64?) {
 /// Returns the content length extracted from the [responseHeaders], or from
 /// the [task] headers
 func getContentLength(responseHeaders: [AnyHashable: Any], task: Task) -> Int64 {
-    // On iOS, the header has already been parsed for Content-Length so we don't need to
-    // repeat that here (actually, we use the bytesExpectedToSend which is for some reason
-    // not always set even whe a Content-Length is set)
+    if let contentLength = Int64(headerValue(responseHeaders: responseHeaders, name: "Content-Length") ?? ""), contentLength != -1 {
+        return contentLength
+    }
     // Try extracting content length from Range header
-    let taskRangeHeader = task.headers["Range"] ?? ""
+    let taskRangeHeader = headerValue(headers: task.headers, name: "Range") ?? ""
     let taskRange = parseRange(rangeStr: taskRangeHeader)
     if let end = taskRange.1 {
         let rangeLength = end - taskRange.0 + 1
         os_log("TaskId %@ contentLength set to %d based on Range header", log: log, type: .info, task.taskId, rangeLength)
         return rangeLength
     }
-    
+
     // try extracting it from a special "Known-Content-Length" header
-    let knownLength = Int64(task.headers["Known-Content-Length"] ?? "-1") ?? -1
+    let knownLength = Int64(headerValue(headers: task.headers, name: "Known-Content-Length") ?? "-1") ?? -1
     if knownLength != -1 {
         os_log("TaskId %@ contentLength set to %d based on Known-Content-Length header", log: log, type: .info, task.taskId, knownLength)
     } else {
@@ -258,7 +335,7 @@ func getContentLength(responseHeaders: [AnyHashable: Any], task: Task) -> Int64 
 /// Sets the mimeType and charSet extracted from the Content-Type header
 /// in [responseHeaders] and stores in static maps keyed by [task.taskId]
 func extractContentType(responseHeaders: [AnyHashable: Any], task: Task)  {
-    guard let contentType = responseHeaders["Content-Type"] as? String else { return }
+    guard let contentType = headerValue(responseHeaders: responseHeaders, name: "Content-Type") else { return }
     let regEx = try! NSRegularExpression(pattern: #"(.*);\s*charset\s*=(.*)"#)
     let range = NSMakeRange(0, contentType.utf16.count)
     let match = regEx.firstMatch(in: contentType, options: [], range: range)
@@ -351,9 +428,8 @@ func updateProgress(task: Task, totalBytesExpected: Int64, totalBytesDone: Int64
 
 /// Processes a change in status for the task
 ///
-/// Sends status update via the background channel to Dart, if requested
-/// If the task is finished, processes a final progressUpdate update and removes
-/// task from persistent storage
+/// Sends status update via the background channel to Dart. Dart decides which
+/// updates are user-visible and synthesizes terminal progress.
 func processStatusUpdate(task: Task, status: TaskStatus, taskException: TaskException? = nil, responseBody: String? = nil, responseHeaders: [AnyHashable:Any]? = nil, responseStatusCode: Int? = nil, mimeType: String? = nil, charSet: String? = nil) {
     // Intercept status updates resulting from re-enqueue requests, which
     // themselves are triggered by a change in WiFi requirement
@@ -378,28 +454,8 @@ func processStatusUpdate(task: Task, status: TaskStatus, taskException: TaskExce
 
     // Normal status update
 
-    // Post update if task expects one, or if failed and retry is needed
+    // Retry orchestration and terminal progress are generated on the Dart side.
     let retryNeeded = status == TaskStatus.failed && task.retriesRemaining > 0
-    // if task is in final state, process a final progressUpdate
-    // A 'failed' progress update is only provided if
-    // a retry is not needed: if it is needed, a `waitingToRetry` progress update
-    // will be generated on the Dart side
-    switch (status) {
-        case .complete:
-            processProgressUpdate(task: task, progress: 1.0)
-        case .failed:
-            if !retryNeeded {
-                processProgressUpdate(task: task, progress: -1.0)
-            }
-        case .canceled:
-            processProgressUpdate(task: task, progress: -2.0)
-        case .notFound:
-            processProgressUpdate(task: task, progress: -3.0)
-        case .paused:
-            processProgressUpdate(task: task, progress: -5.0)
-        default:
-            break
-    }
     // determine the TaskStatusUpdate
     let finalResponseStatusCode = status == .complete || status == .notFound
         ? responseStatusCode
@@ -417,16 +473,15 @@ func processStatusUpdate(task: Task, status: TaskStatus, taskException: TaskExce
                            mimeType: mimeType,
                            charSet: charSet)
         : TaskStatusUpdate(task: task, taskStatus: status)
-    if providesStatusUpdates(downloadTask: task) || retryNeeded {
-        let arg = statusUpdate.argList()
-        if !postOnBackgroundChannel(method: "statusUpdate", task: task, arg: arg) {
-            // store update locally as a merged task/status JSON string, without error info
-            guard let jsonData = try? JSONEncoder().encode(statusUpdate)
-            else {
-                os_log("Could not store status update locally", log: log, type: .debug)
-                return }
-            storeLocally(prefsKey: BDPlugin.keyStatusUpdateMap, taskId: task.taskId, item: jsonData)
-        }
+    // Dart decides which status updates are user-visible.
+    let arg = statusUpdate.argList()
+    if !postOnBackgroundChannel(method: "statusUpdate", task: task, arg: arg) {
+        // store update locally as a merged task/status JSON string, without error info
+        guard let jsonData = try? JSONEncoder().encode(statusUpdate)
+        else {
+            os_log("Could not store status update locally", log: log, type: .debug)
+            return }
+        storeLocally(prefsKey: BDPlugin.keyStatusUpdateMap, taskId: task.taskId, item: jsonData)
     }
     if isFinalState(status: status) {
         // remove references to this task that are no longer needed
@@ -442,7 +497,7 @@ func processStatusUpdate(task: Task, status: TaskStatus, taskException: TaskExce
             BDPlugin.taskIdsProgrammaticallyCanceledAfterStart.remove(task.taskId)
         }
         // invoke onTaskFinished callback if needed
-        if task.options?.hasOnFinishedCallback() == true {
+        if !retryNeeded && task.options?.hasOnFinishedCallback() == true {
             _Concurrency.Task {
                 if !(await invokeOnTaskFinishedCallback(taskStatusUpdate: statusUpdate)) {
                     os_log("Could not invoke onTaskFinishedCallback", log: log, type: .error)

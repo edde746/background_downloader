@@ -42,15 +42,13 @@ String urlWithQueryParameters(
 int getContentLength(Map<String, String> responseHeaders, Task task) {
   // if response provides contentLength, return it
   final contentLength = int.tryParse(
-    responseHeaders['Content-Length'] ??
-        responseHeaders['content-length'] ??
-        '-1',
+    _headerValue(responseHeaders, 'Content-Length') ?? '-1',
   );
   if (contentLength != null && contentLength != -1) {
     return contentLength;
   }
   // try extracting it from Range header
-  final taskRangeHeader = task.headers['Range'] ?? task.headers['range'] ?? '';
+  final taskRangeHeader = _headerValue(task.headers, 'Range') ?? '';
   final taskRange = parseRange(taskRangeHeader);
   if (taskRange.$2 != null) {
     var rangeLength = taskRange.$2! - taskRange.$1 + 1;
@@ -60,12 +58,8 @@ int getContentLength(Map<String, String> responseHeaders, Task task) {
     return rangeLength;
   }
   // try extracting it from a special "Known-Content-Length" header
-  var knownLength =
-      int.tryParse(
-        task.headers['Known-Content-Length'] ??
-            task.headers['known-content-length'] ??
-            '-1',
-      ) ??
+  var knownLength = int.tryParse(
+          _headerValue(task.headers, 'Known-Content-Length') ?? '-1') ??
       -1;
   if (knownLength != -1) {
     _log.finest(
@@ -123,45 +117,12 @@ Future<DownloadTask> taskWithSuggestedFilename(
   }
 
   // start of main function
-  try {
-    final disposition = responseHeaders.entries
-        .firstWhere(
-          (element) => element.key.toLowerCase() == 'content-disposition',
-        )
-        .value;
-    // Try filename*=UTF-8'language'"encodedFilename"
-    final encodedFilenameRegEx = RegExp(
-      'filename\\*=\\s*([^\']+)\'([^\']*)\'"?([^"]+)"?',
-      caseSensitive: false,
-    );
-    var match = encodedFilenameRegEx.firstMatch(disposition);
-    if (match != null &&
-        match.group(1)?.isNotEmpty == true &&
-        match.group(3)?.isNotEmpty == true) {
-      try {
-        final suggestedFilename = match.group(1)?.toUpperCase() == 'UTF-8'
-            ? Uri.decodeComponent(match.group(3)!)
-            : match.group(3)!;
-        return uniqueFilename(
-          task.copyWith(filename: suggestedFilename),
-          unique,
-        );
-      } on ArgumentError {
-        _log.finest(
-          'Could not interpret suggested filename (UTF-8 url encoded) ${match.group(3)}',
-        );
-      }
-    }
-    // Try filename="filename"
-    final plainFilenameRegEx = RegExp(
-      r'filename=\s*"?([^"]+)"?.*$',
-      caseSensitive: false,
-    );
-    match = plainFilenameRegEx.firstMatch(disposition);
-    if (match != null && match.group(1)?.isNotEmpty == true) {
-      return uniqueFilename(task.copyWith(filename: match.group(1)), unique);
-    }
-  } catch (_) {}
+  final disposition = _headerValue(responseHeaders, 'Content-Disposition');
+  final filename =
+      disposition == null ? null : _filenameFromContentDisposition(disposition);
+  if (filename?.isNotEmpty == true) {
+    return uniqueFilename(task.copyWith(filename: filename), unique);
+  }
   _log.finest('Could not determine suggested filename from server');
   // Try filename derived from last path segment of the url
   try {
@@ -172,4 +133,96 @@ Future<DownloadTask> taskWithSuggestedFilename(
   // if everything fails, return the task with unchanged filename
   // except for possibly making it unique
   return uniqueFilename(task, unique);
+}
+
+String? _headerValue(Map<String, String> headers, String name) {
+  final lowerName = name.toLowerCase();
+  for (final entry in headers.entries) {
+    if (entry.key.toLowerCase() == lowerName && entry.value.isNotEmpty) {
+      return entry.value;
+    }
+  }
+  return null;
+}
+
+String? _filenameFromContentDisposition(String disposition) {
+  final parameters = _contentDispositionParameters(disposition);
+  final encodedFilename = parameters['filename*'];
+  if (encodedFilename != null) {
+    final decoded = _decodeExtendedFilename(encodedFilename);
+    if (decoded?.isNotEmpty == true) return decoded;
+  }
+  return parameters['filename'];
+}
+
+String? _decodeExtendedFilename(String value) {
+  final firstQuote = value.indexOf("'");
+  if (firstQuote < 0) return value;
+  final secondQuote = value.indexOf("'", firstQuote + 1);
+  if (secondQuote < 0) return value;
+  final charset = value.substring(0, firstQuote).toUpperCase();
+  final encoded = value.substring(secondQuote + 1);
+  if (charset != 'UTF-8') return encoded;
+  try {
+    return Uri.decodeComponent(encoded);
+  } on ArgumentError {
+    _log.finest(
+      'Could not interpret suggested filename (UTF-8 url encoded) $encoded',
+    );
+    return null;
+  }
+}
+
+Map<String, String> _contentDispositionParameters(String disposition) {
+  final parameters = <String, String>{};
+  for (final segment in _splitContentDisposition(disposition).skip(1)) {
+    final equalsIndex = segment.indexOf('=');
+    if (equalsIndex <= 0) continue;
+    final key = segment.substring(0, equalsIndex).trim().toLowerCase();
+    final value =
+        _unquoteHeaderValue(segment.substring(equalsIndex + 1).trim());
+    if (key.isNotEmpty && value.isNotEmpty) parameters[key] = value;
+  }
+  return parameters;
+}
+
+List<String> _splitContentDisposition(String value) {
+  final segments = <String>[];
+  final current = StringBuffer();
+  var inQuotes = false;
+  var escaped = false;
+  for (final codeUnit in value.codeUnits) {
+    final char = String.fromCharCode(codeUnit);
+    if (escaped) {
+      current.write(char);
+      escaped = false;
+      continue;
+    }
+    if (char == '\\' && inQuotes) {
+      escaped = true;
+      current.write(char);
+      continue;
+    }
+    if (char == '"') {
+      inQuotes = !inQuotes;
+      current.write(char);
+      continue;
+    }
+    if (char == ';' && !inQuotes) {
+      segments.add(current.toString().trim());
+      current.clear();
+      continue;
+    }
+    current.write(char);
+  }
+  segments.add(current.toString().trim());
+  return segments;
+}
+
+String _unquoteHeaderValue(String value) {
+  if (value.length >= 2 && value.startsWith('"') && value.endsWith('"')) {
+    final unquoted = value.substring(1, value.length - 1);
+    return unquoted.replaceAll(r'\"', '"').replaceAll(r'\\', '\\');
+  }
+  return value;
 }
