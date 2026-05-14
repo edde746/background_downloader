@@ -190,6 +190,10 @@ final class DesktopDownloader extends BaseDownloader {
     ), onError: errorPort.sendPort);
     final messagesFromIsolate = StreamQueue<dynamic>(receivePort);
     final sendPort = await messagesFromIsolate.next as SendPort;
+    final wasCanceledBeforeSendPort = _isolateSendPorts.keys.contains(task);
+    // Store the isolate's sendPort before sending task arguments, so any new
+    // cancellation request can be delivered directly to the isolate.
+    _isolateSendPorts[task] = sendPort;
     sendPort.send((
       task,
       resumeData,
@@ -199,14 +203,8 @@ final class DesktopDownloader extends BaseDownloader {
       bypassTLSCertificateValidation,
       _mtlsConfigs,
       tempFilePath,
+      wasCanceledBeforeSendPort,
     ));
-    if (_isolateSendPorts.keys.contains(task)) {
-      // if already registered with null value, cancel immediately
-      sendPort.send('cancel');
-    }
-    // store the isolate's sendPort so we can send it messages for
-    // cancellation, and for managing parallel downloads
-    _isolateSendPorts[task] = sendPort;
     // listen for messages sent back from the isolate, until 'done'
     // note that the task sent by the isolate may have changed. Therefore, we
     // use updatedTask instead of task from here on

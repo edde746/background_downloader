@@ -58,5 +58,83 @@ void main() {
       expect(await referenced.exists(), isTrue);
       expect(await unrelated.exists(), isTrue);
     });
+
+    test('deletes unreferenced tracked desktop partial files', () async {
+      final tempDir = await Directory.systemTemp.createTemp(
+        'bd_part_cleanup_',
+      );
+      addTearDown(() async {
+        if (await tempDir.exists()) {
+          await tempDir.delete(recursive: true);
+        }
+      });
+
+      final orphanDest = File(
+        '${tempDir.path}${Platform.pathSeparator}orphan.bin',
+      );
+      final referencedDest = File(
+        '${tempDir.path}${Platform.pathSeparator}referenced.bin',
+      );
+      final activeDest = File(
+        '${tempDir.path}${Platform.pathSeparator}active.bin',
+      );
+      final replacementDest = File(
+        '${tempDir.path}${Platform.pathSeparator}replacement.bin',
+      );
+      final untrackedPart = File(
+        '${tempDir.path}${Platform.pathSeparator}untracked.bin.part',
+      );
+      final orphanPart = File(partialDownloadFilePath(orphanDest.path));
+      final referencedPart = File(partialDownloadFilePath(referencedDest.path));
+      final activePart = File(partialDownloadFilePath(activeDest.path));
+      final replacementPart =
+          File(partialDownloadFilePath(replacementDest.path));
+      await Future.wait([
+        orphanPart.writeAsString('orphan'),
+        referencedPart.writeAsString('referenced'),
+        activePart.writeAsString('active'),
+        replacementPart.writeAsString('replacement'),
+        untrackedPart.writeAsString('untracked'),
+      ]);
+
+      final orphanTask = _taskForFile('orphan-task', orphanDest);
+      final referencedTask = _taskForFile('referenced-task', referencedDest);
+      final activeTask = _taskForFile('active-task', activeDest);
+      final replacedTask = _taskForFile('replaced-task', replacementDest);
+      final replacementActiveTask = _taskForFile(
+        'replacement-active-task',
+        replacementDest,
+      );
+
+      final deleted = await deleteOrphanedPartialDownloadFiles(
+        trackedTasks: [orphanTask, referencedTask, activeTask, replacedTask],
+        allResumeData: [
+          ResumeData(referencedTask, referencedPart.path, 1, 'tag'),
+        ],
+        activeTasks: [activeTask, replacementActiveTask],
+      );
+
+      final expectedDeleted =
+          Platform.isWindows || Platform.isMacOS || Platform.isLinux ? 1 : 0;
+      expect(deleted, expectedDeleted);
+      expect(
+        await orphanPart.exists(),
+        expectedDeleted == 0 ? isTrue : isFalse,
+      );
+      expect(await referencedPart.exists(), isTrue);
+      expect(await activePart.exists(), isTrue);
+      expect(await replacementPart.exists(), isTrue);
+      expect(await untrackedPart.exists(), isTrue);
+    });
   });
+}
+
+DownloadTask _taskForFile(String taskId, File file) {
+  return DownloadTask(
+    taskId: taskId,
+    url: 'https://example.com/${file.uri.pathSegments.last}',
+    filename: file.uri.pathSegments.last,
+    directory: file.parent.path,
+    baseDirectory: BaseDirectory.root,
+  );
 }
