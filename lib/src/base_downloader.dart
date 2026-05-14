@@ -794,8 +794,26 @@ abstract base class BaseDownloader {
   /// Remove orphaned temporary files created by older downloader versions.
   Future<int> cleanUpOrphanedTempFiles() async {
     await ready;
+    if (Platform.isAndroid) {
+      try {
+        final activeTasks = await allTasks(
+          FileDownloader.defaultGroup,
+          true,
+          true,
+        );
+        if (activeTasks.isNotEmpty) {
+          log.fine(
+            'Skipping orphaned temp cleanup: ${activeTasks.length} active Android task(s)',
+          );
+          return 0;
+        }
+      } catch (e) {
+        log.fine('Skipping Android orphaned temp cleanup: $e');
+        return 0;
+      }
+    }
     final resumeData = await _storage.retrieveAllResumeData();
-    return deleteOrphanedLegacyDesktopTempFiles(resumeData, log: log);
+    return deleteOrphanedLegacyTempFiles(resumeData, log: log);
   }
 
   /// Store the paused [task]

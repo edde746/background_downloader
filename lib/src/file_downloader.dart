@@ -641,8 +641,9 @@ interface class FileDownloader {
 
   /// Deletes orphaned temporary files created by older downloader versions.
   ///
-  /// This currently only affects legacy random temp files on Windows. Active
-  /// or resumable files referenced by stored resume data are preserved.
+  /// This currently only affects legacy random temp files on desktop and
+  /// Android. Active or resumable files referenced by stored resume data are
+  /// preserved.
   Future<int> cleanUpOrphanedTempFiles() =>
       _downloader.cleanUpOrphanedTempFiles();
 

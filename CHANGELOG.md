@@ -2,7 +2,7 @@
 
 * Add `TaskOptions` to `DataTask` with similar functionality as in `DownloadTask`
 * [Desktop] Download to destination-local `.part` files before rename to avoid cross-disk copies and orphaned random temp files
-* [Windows] Add cleanup for unreferenced legacy random temp files
+* [Desktop/Android] Add cleanup for unreferenced legacy random temp files
 * [Android] Delete resumable temporary files when resume state is discarded or replaced
 * [Android] Reuse existing SAF target files on URI download retries to avoid numbered duplicates
 * Bug fixes

@@ -10,7 +10,7 @@ import 'models.dart';
 import 'task.dart';
 
 final _windowsAbsolutePathRegExp = RegExp(r'^[a-zA-Z]:[\\/]');
-const _legacyDesktopTempFilePrefix = 'com.bbflight.background_downloader';
+const _legacyTempFilePrefix = 'com.bbflight.background_downloader';
 
 /// Returns the destination-local temporary file path for a desktop download.
 String partialDownloadFilePath(String filePath) => '$filePath.part';
@@ -112,20 +112,20 @@ Future<bool> deleteResumeDataTempFile(String value, {Logger? log}) async {
   return false;
 }
 
-/// Deletes old random Windows temp files that are no longer referenced by
-/// stored resume data.
+/// Deletes old random temp files that are no longer referenced by stored resume
+/// data.
 ///
-/// Desktop downloads now use destination-local `.part` files. This only cleans
-/// up files created by older versions in `%TEMP%` with the legacy random prefix.
-Future<int> deleteOrphanedLegacyDesktopTempFiles(
+/// Desktop downloads now use destination-local `.part` files. Android still
+/// writes temporary files in app-owned cache/support directories. This cleanup
+/// only removes files with the legacy random prefix.
+Future<int> deleteOrphanedLegacyTempFiles(
   Iterable<ResumeData> allResumeData, {
-  Directory? temporaryDirectory,
+  Iterable<Directory>? directories,
   Logger? log,
 }) async {
-  if (!Platform.isWindows) return 0;
-
-  final tempDir = temporaryDirectory ?? await getTemporaryDirectory();
-  if (!await tempDir.exists()) return 0;
+  final scanDirectories = directories?.toList(growable: false) ??
+      await _defaultLegacyTempDirectories();
+  if (scanDirectories.isEmpty) return 0;
 
   final referencedPaths = <String>{};
   for (final resumeData in allResumeData) {
@@ -135,22 +135,51 @@ Future<int> deleteOrphanedLegacyDesktopTempFiles(
   }
 
   var deleted = 0;
-  await for (final entity in tempDir.list()) {
-    if (entity is! File) continue;
-    if (!p.basename(entity.path).startsWith(_legacyDesktopTempFilePrefix)) {
-      continue;
-    }
-    if (referencedPaths.contains(_pathKey(entity.path))) continue;
-    try {
-      await entity.delete();
-      deleted++;
-      log?.fine('Deleted orphaned legacy temp file ${entity.path}');
-    } on FileSystemException catch (e) {
-      log?.fine(
-          'Could not delete orphaned legacy temp file ${entity.path}: $e');
+  final scannedPathKeys = <String>{};
+  for (final directory in scanDirectories) {
+    final directoryPathKey = _pathKey(directory.path);
+    if (!scannedPathKeys.add(directoryPathKey)) continue;
+    if (!await directory.exists()) continue;
+    await for (final entity in directory.list()) {
+      if (entity is! File) continue;
+      if (!p.basename(entity.path).startsWith(_legacyTempFilePrefix)) {
+        continue;
+      }
+      if (referencedPaths.contains(_pathKey(entity.path))) continue;
+      try {
+        await entity.delete();
+        deleted++;
+        log?.fine('Deleted orphaned legacy temp file ${entity.path}');
+      } on FileSystemException catch (e) {
+        log?.fine(
+          'Could not delete orphaned legacy temp file ${entity.path}: $e',
+        );
+      }
     }
   }
   return deleted;
+}
+
+Future<List<Directory>> _defaultLegacyTempDirectories() async {
+  if (Platform.isWindows || Platform.isMacOS || Platform.isLinux) {
+    return [await getTemporaryDirectory()];
+  }
+  if (!Platform.isAndroid) return [];
+
+  final directories = <Directory>[
+    await getTemporaryDirectory(),
+    await getApplicationSupportDirectory(),
+  ];
+  final externalCacheDirectories = await getExternalCacheDirectories();
+  if (externalCacheDirectories != null) {
+    directories.addAll(externalCacheDirectories);
+  }
+  final externalStorageDirectory = await getExternalStorageDirectory();
+  if (externalStorageDirectory != null) {
+    directories
+        .add(Directory(p.join(externalStorageDirectory.path, 'Support')));
+  }
+  return directories;
 }
 
 String? _filePathFromResumeData(String value) {
