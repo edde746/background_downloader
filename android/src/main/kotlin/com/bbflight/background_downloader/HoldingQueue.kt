@@ -114,15 +114,59 @@ class HoldingQueue(private val context: Context, private val workManager: WorkMa
      * Add [EnqueueItem] [item] to the queue and advance the queue if possible
      */
     suspend fun add(item: EnqueueItem) {
+        var shouldAdvance = false
         stateMutex.withLock {
-            queue.add(item)
-            enqueuedTaskIds.add(item.task.taskId)
-            NotificationService.registerEnqueue(
-                item,
-                success = true
-            ) // for group notification count
+            val taskId = item.task.taskId
+            val queuedDuplicates = queue.filter { it.task.taskId == taskId }
+            when {
+                queuedDuplicates.isNotEmpty() -> {
+                    queuedDuplicates.forEach { queue.remove(it) }
+                    queue.add(item)
+                    if (!enqueuedTaskIds.contains(taskId)) {
+                        enqueuedTaskIds.add(taskId)
+                        NotificationService.registerEnqueue(item, success = true)
+                    }
+                    Log.i(BDPlugin.TAG, "Replaced queued duplicate task with id $taskId")
+                    shouldAdvance = true
+                }
+                enqueuedTaskIds.contains(taskId) || isTaskIdActive(taskId) -> {
+                    Log.i(BDPlugin.TAG, "Ignoring duplicate active task with id $taskId")
+                }
+                else -> {
+                    queue.add(item)
+                    enqueuedTaskIds.add(taskId)
+                    NotificationService.registerEnqueue(
+                        item,
+                        success = true
+                    ) // for group notification count
+                    shouldAdvance = true
+                }
+            }
         }
-        advanceQueue()
+        if (shouldAdvance) advanceQueue()
+    }
+
+    private fun isTaskIdActive(taskId: String): Boolean {
+        try {
+            val workInfos = workManager.getWorkInfosByTag("taskId=$taskId").get()
+            if (workInfos.any { !it.state.isFinished }) return true
+
+            if (Build.VERSION.SDK_INT >= 34) {
+                val jobScheduler = context.getSystemService(Context.JOB_SCHEDULER_SERVICE) as JobScheduler
+                val jobInfo = jobScheduler.getPendingJob(taskId.hashCode()) ?: return false
+                val taskJson = jobInfo.extras.getString(TaskWorker.keyTask) ?: return false
+                return try {
+                    Json.decodeFromString<Task>(taskJson).taskId == taskId
+                } catch (_: Exception) {
+                    false
+                }
+            }
+
+            return false
+        } catch (e: Exception) {
+            Log.w(BDPlugin.TAG, "Could not check active state for taskId $taskId: $e")
+            return false
+        }
     }
 
     /**
