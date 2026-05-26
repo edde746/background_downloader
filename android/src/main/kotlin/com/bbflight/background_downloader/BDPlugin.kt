@@ -20,6 +20,7 @@ import androidx.core.content.edit
 import androidx.preference.PreferenceManager
 import androidx.work.Constraints
 import androidx.work.Data
+import androidx.work.ExistingWorkPolicy
 import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.OutOfQuotaPolicy
@@ -134,6 +135,20 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
             Collections.synchronizedMap(mutableMapOf<String, Long>()) // <taskId, size>
         var haveLoggedProxyMessage = false
         var holdingQueue: HoldingQueue? = null
+
+        private const val uniqueWorkPrefix = "com.bbflight.background_downloader.task."
+
+        private fun uniqueWorkName(task: Task): String = "$uniqueWorkPrefix${task.taskId}"
+
+        private fun uniqueWorkPolicy(
+            task: Task,
+            resumeData: ResumeData?,
+            initialDelayMillis: Long
+        ): ExistingWorkPolicy {
+            val isContinuation =
+                resumeData != null || initialDelayMillis > 0 || task.retriesRemaining < task.retries
+            return if (isContinuation) ExistingWorkPolicy.APPEND_OR_REPLACE else ExistingWorkPolicy.KEEP
+        }
 
         /**
          * Enqueue a WorkManager task based on the provided parameters
@@ -281,9 +296,14 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
                     requestBuilder.setExpedited(policy = OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
                 }
                 val workManager = WorkManager.getInstance(context)
+                val uniquePolicy = uniqueWorkPolicy(task, resumeData, initialDelayMillis)
                 success = try {
                     val operation = try {
-                        workManager.enqueue(requestBuilder.build())
+                        workManager.enqueueUniqueWork(
+                            uniqueWorkName(task),
+                            uniquePolicy,
+                            requestBuilder.build()
+                        )
                     } catch (e: Exception) {
                          if (expedited) {
                              Log.i(TAG, "Could not enqueue expedited task, falling back to non-expedited")
@@ -295,7 +315,11 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
                                      TimeUnit.MILLISECONDS
                                  )
                              }
-                             workManager.enqueue(nonExpeditedRequestBuilder.build())
+                             workManager.enqueueUniqueWork(
+                                 uniqueWorkName(task),
+                                 uniquePolicy,
+                                 nonExpeditedRequestBuilder.build()
+                             )
                          } else {
                              throw e
                          }
