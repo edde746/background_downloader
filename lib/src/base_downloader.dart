@@ -509,7 +509,7 @@ abstract base class BaseDownloader {
     // remove tasks waiting to retry from the list so they won't be retried
     for (final task in matchingTasksWaitingToRetry) {
       tasksWaitingToRetry.remove(task);
-      _clearPauseResumeInfo(task);
+      // processStatusUpdate clears pause/resume info for final states
       processStatusUpdate(TaskStatusUpdate(task, TaskStatus.canceled));
       updateNotification(task, null); // remove notification
     }
@@ -873,10 +873,11 @@ abstract base class BaseDownloader {
 
   Future<void> _discardResumeDataForReplacement(Task task) async {
     await ready;
+    final resumeData = await _storage.retrieveAllResumeData();
+    if (resumeData.isEmpty) return;
     final targetPath = await _replacementPath(task);
     if (targetPath == null) return;
 
-    final resumeData = await _storage.retrieveAllResumeData();
     for (final data in resumeData) {
       final existingPath = await _replacementPath(data.task);
       if (existingPath == targetPath) {
