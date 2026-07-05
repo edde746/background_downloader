@@ -1,3 +1,19 @@
+## 9.5.5
+
+* [Android] Bug fixes and performance improvements (from upstream 9.5.5):
+  - Fixes a potential UI freeze during application startup
+  - Prevents App Not Responding (ANR) crashes when tapping notification actions (Cancel/Pause/Resume) under heavy system load
+  - Fixes group notifications running in the foreground (issue #648)
+  - Migrated build configuration to Flutter's built-in Kotlin Gradle plugin configuration and upgraded Gradle to 8.14
+* [iOS] Fixes redundant updates and visual "flashing" of group notifications (from upstream 9.5.5, fixes #656)
+* Removed 'Background Fetch' requirement from documentation (from upstream 9.5.5, fixes #668)
+* [Android] SAF resume validates the server's `Content-Range` offset before appending, preventing silent file corruption when a server or CDN offers a different range
+* [Android] SAF resume falls back to a fresh restart when the document provider does not support append mode, and failed or canceled SAF resumes now delete the partial document instead of orphaning it
+* [Android] `file://` URI downloads now pause and resume correctly instead of silently restarting from zero
+* [Android] Enqueue no longer reports a task as enqueued when the holding queue drops it as a duplicate, and resume/retry enqueues are never dropped
+* [Android/Desktop] Partial download files are now named `<destination>.<taskId hash>.part`, so tasks targeting the same destination no longer share (and can no longer delete) each other's temp files; `.part` files from older builds are still cleaned up
+* Terminal progress updates (e.g. 1.0 for complete) are now emitted just before the final status update on all platforms; previously native platforms emitted them just after
+
 ## 9.5.4
 
 * Add `TaskOptions` to `DataTask` with similar functionality as in `DownloadTask`
