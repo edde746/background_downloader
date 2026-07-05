@@ -85,11 +85,42 @@ fun insufficientSpace(applicationContext: Context, contentLength: Long, targetFi
         return false
     }
     val path = targetFile?.parentFile ?: Environment.getDataDirectory()
-    val stat = StatFs(path.path)
+    val stat = try {
+        StatFs(path.path)
+    } catch (e: IllegalArgumentException) {
+        // path may not exist (e.g. mkdirs failed); let the actual file operation
+        // surface the real error instead of misreporting insufficient space
+        Log.i(BDPlugin.TAG, "Could not check available space at ${path.path}: ${e.message}")
+        return false
+    }
     val available = stat.blockSizeLong * stat.availableBlocksLong
     return available - (BDPlugin.remainingBytesToDownload.values.sum()
             + contentLength) < (checkValue.toLong() shl 20)
 }
+
+/**
+ * 8-char lowercase hex FNV-1a 32-bit hash of [taskId]
+ *
+ * MUST stay identical to partFileSuffix in lib/src/resume_data_cleanup.dart:
+ * the Dart orphan scan reconstructs Android-created part file paths from the
+ * destination path and taskId alone
+ */
+fun partFileSuffix(taskId: String): String {
+    var hash = 0x811c9dc5L
+    for (b in taskId.toByteArray(Charsets.UTF_8)) {
+        hash = ((hash xor (b.toLong() and 0xffL)) * 0x01000193L) and 0xffffffffL
+    }
+    return hash.toString(16).padStart(8, '0')
+}
+
+/**
+ * Returns the destination-local temporary file path for a download
+ *
+ * The taskId-derived suffix keeps temp files of different tasks targeting
+ * the same destination from colliding
+ */
+fun partialDownloadFilePath(destFilePath: String, taskId: String): String =
+    "$destFilePath.${partFileSuffix(taskId)}.part"
 
 /**
  * Parses the range in a Range header, and returns a Pair representing
@@ -270,12 +301,7 @@ private fun decodeExtendedFilename(value: String): String? {
     val charset = value.substring(0, firstQuote).uppercase()
     val encoded = value.substring(secondQuote + 1)
     if (charset != "UTF-8") return encoded
-    return try {
-        Uri.decode(encoded)
-    } catch (_: Exception) {
-        Log.d(TAG, "Could not interpret suggested filename (UTF-8 url encoded) $encoded")
-        null
-    }
+    return Uri.decode(encoded)
 }
 
 private fun contentDispositionParameters(disposition: String): Map<String, String> {

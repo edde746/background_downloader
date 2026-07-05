@@ -41,9 +41,9 @@ Future<void> doDownloadTask(
       : tempFilePathConfig != null
           ? p.join(
               tempFilePathConfig,
-              p.basename(partialDownloadFilePath(filePath)),
+              p.basename(partialDownloadFilePath(filePath, downloadTask.taskId)),
             )
-          : partialDownloadFilePath(filePath);
+          : partialDownloadFilePath(filePath, downloadTask.taskId);
   final requiredStartByte =
       resumeData?.requiredStartByte ?? 0; // start for resume
   final eTag = resumeData?.eTag;
@@ -95,7 +95,7 @@ Future<void> doDownloadTask(
         // update the filePath by replacing the last segment with the new filename
         filePath = p.join(p.dirname(filePath), downloadTask.filename);
         if (!isResume) {
-          tempFilePath = partialDownloadFilePath(filePath);
+          tempFilePath = partialDownloadFilePath(filePath, downloadTask.taskId);
         }
         log.finest(
           'Suggested filename for taskId ${task.taskId}: ${task.filename}',

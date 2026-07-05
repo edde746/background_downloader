@@ -12,8 +12,28 @@ import 'task.dart';
 final _windowsAbsolutePathRegExp = RegExp(r'^[a-zA-Z]:[\\/]');
 const _legacyTempFilePrefix = 'com.bbflight.background_downloader';
 
-/// Returns the destination-local temporary file path for a desktop download.
-String partialDownloadFilePath(String filePath) => '$filePath.part';
+/// 8-char lowercase hex FNV-1a 32-bit hash of [taskId].
+///
+/// MUST stay identical to partFileSuffix in android Helpers.kt: the orphan
+/// scan reconstructs Android-created part file paths from the destination
+/// path and taskId alone.
+String partFileSuffix(String taskId) {
+  var hash = 0x811c9dc5;
+  for (final byte in utf8.encode(taskId)) {
+    hash = ((hash ^ byte) * 0x01000193) & 0xFFFFFFFF;
+  }
+  return hash.toRadixString(16).padLeft(8, '0');
+}
+
+/// Returns the destination-local temporary file path for a download.
+///
+/// The taskId-derived suffix keeps temp files of different tasks targeting
+/// the same destination from colliding.
+String partialDownloadFilePath(String filePath, String taskId) =>
+    '$filePath.${partFileSuffix(taskId)}.part';
+
+/// Pre-suffix naming, kept only so cleanup can remove files from older builds.
+String legacyPartialDownloadFilePath(String filePath) => '$filePath.part';
 
 /// Deletes temporary files referenced by [resumeData].
 ///
@@ -168,11 +188,14 @@ Future<int> deleteOrphanedPartialDownloadFiles({
 
   final referencedPaths = _referencedResumePathKeys(allResumeData);
   final activeTaskIds = activeTasks.map((task) => task.taskId).toSet();
+  // Includes the legacy form: an active task resumed from a pre-suffix build
+  // is still writing `<dest>.part`, and its resume data was removed at
+  // execution start, so referencedPaths does not protect it
   final activePartPathKeys = <String>{};
   for (final task in activeTasks) {
     if (task is! DownloadTask || task is UriDownloadTask) continue;
-    final activePartFilePath = await _partialFilePathForTask(task, log: log);
-    if (activePartFilePath != null) {
+    final activePartFilePaths = await _partialFilePathsForTask(task, log: log);
+    for (final activePartFilePath in activePartFilePaths ?? const <String>[]) {
       activePartPathKeys.add(_pathKey(activePartFilePath));
     }
   }
@@ -182,22 +205,24 @@ Future<int> deleteOrphanedPartialDownloadFiles({
   for (final task in trackedTasks) {
     if (task is! DownloadTask || task is UriDownloadTask) continue;
     if (activeTaskIds.contains(task.taskId)) continue;
-    final partFilePath = await _partialFilePathForTask(task, log: log);
-    if (partFilePath == null) continue;
-    final pathKey = _pathKey(partFilePath);
-    if (!scannedPathKeys.add(pathKey)) continue;
-    if (activePartPathKeys.contains(pathKey)) continue;
-    if (referencedPaths.contains(pathKey)) continue;
+    final partFilePaths = await _partialFilePathsForTask(task, log: log);
+    if (partFilePaths == null) continue;
+    for (final partFilePath in partFilePaths) {
+      final pathKey = _pathKey(partFilePath);
+      if (!scannedPathKeys.add(pathKey)) continue;
+      if (activePartPathKeys.contains(pathKey)) continue;
+      if (referencedPaths.contains(pathKey)) continue;
 
-    final file = File(partFilePath);
-    try {
-      if (await file.exists()) {
-        await file.delete();
-        deleted++;
-        log?.fine('Deleted orphaned partial download file $partFilePath');
+      final file = File(partFilePath);
+      try {
+        if (await file.exists()) {
+          await file.delete();
+          deleted++;
+          log?.fine('Deleted orphaned partial download file $partFilePath');
+        }
+      } on FileSystemException catch (e) {
+        log?.fine('Could not delete partial download file $partFilePath: $e');
       }
-    } on FileSystemException catch (e) {
-      log?.fine('Could not delete partial download file $partFilePath: $e');
     }
   }
   return deleted;
@@ -235,10 +260,16 @@ Set<String> _referencedResumePathKeys(Iterable<ResumeData> allResumeData) {
   return referencedPaths;
 }
 
-Future<String?> _partialFilePathForTask(DownloadTask task,
+/// Both candidate part file paths for [task]: current (taskId-suffixed) form
+/// first, then the legacy `<dest>.part` form from older builds.
+Future<List<String>?> _partialFilePathsForTask(DownloadTask task,
     {Logger? log}) async {
   try {
-    return partialDownloadFilePath(await task.filePath());
+    final filePath = await task.filePath();
+    return [
+      partialDownloadFilePath(filePath, task.taskId),
+      legacyPartialDownloadFilePath(filePath),
+    ];
   } catch (e) {
     log?.fine('Could not resolve partial download file for ${task.taskId}: $e');
     return null;
