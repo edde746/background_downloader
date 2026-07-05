@@ -642,7 +642,8 @@ interface class FileDownloader {
   /// Deletes orphaned temporary files from interrupted downloads.
   ///
   /// This affects legacy random temp files on desktop and Android, and tracked
-  /// destination-local `.part` files. Active or resumable files
+  /// destination-local partial files (`<dest>.<taskId hash>.part`, or
+  /// `<dest>.part` from older builds). Active or resumable files
   /// referenced by stored resume data are preserved.
   Future<int> cleanUpOrphanedTempFiles() =>
       _downloader.cleanUpOrphanedTempFiles();

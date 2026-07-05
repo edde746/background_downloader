@@ -12,6 +12,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import java.util.Date
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.PriorityBlockingQueue
@@ -40,7 +41,8 @@ class HoldingQueue(private val context: Context, private val workManager: WorkMa
     var maxConcurrentByHost: Int = 1 shl 20
     var maxConcurrentByGroup: Int = 1 shl 20
     val hostByTaskId = ConcurrentHashMap<String, String>()
-    val enqueuedTaskIds = mutableListOf<String>()
+    // concurrent set: mutated under [stateMutex] but also read from other threads
+    val enqueuedTaskIds: MutableSet<String> = ConcurrentHashMap.newKeySet()
 
     private val concurrent = AtomicInteger(0)
     private val concurrentByHost = ConcurrentHashMap<String, AtomicInteger>()
@@ -112,9 +114,15 @@ class HoldingQueue(private val context: Context, private val workManager: WorkMa
 
     /**
      * Add [EnqueueItem] [item] to the queue and advance the queue if possible
+     *
+     * Returns true if the item was accepted, false if it was dropped as a
+     * duplicate of an already queued or active task. Items carrying resume data
+     * are continuations of an existing task, so they are never dropped: the
+     * WorkManager layer enqueues them with APPEND_OR_REPLACE
      */
-    suspend fun add(item: EnqueueItem) {
+    suspend fun add(item: EnqueueItem): Boolean {
         var shouldAdvance = false
+        var accepted = true
         stateMutex.withLock {
             val taskId = item.task.taskId
             val queuedDuplicates = queue.filter { it.task.taskId == taskId }
@@ -129,26 +137,33 @@ class HoldingQueue(private val context: Context, private val workManager: WorkMa
                     Log.i(BDPlugin.TAG, "Replaced queued duplicate task with id $taskId")
                     shouldAdvance = true
                 }
-                enqueuedTaskIds.contains(taskId) || isTaskIdActive(taskId) -> {
+                item.resumeData == null &&
+                        (enqueuedTaskIds.contains(taskId) || isTaskIdActive(taskId)) -> {
                     Log.i(BDPlugin.TAG, "Ignoring duplicate active task with id $taskId")
+                    accepted = false
                 }
                 else -> {
                     queue.add(item)
-                    enqueuedTaskIds.add(taskId)
-                    NotificationService.registerEnqueue(
-                        item,
-                        success = true
-                    ) // for group notification count
+                    if (!enqueuedTaskIds.contains(taskId)) {
+                        enqueuedTaskIds.add(taskId)
+                        NotificationService.registerEnqueue(
+                            item,
+                            success = true
+                        ) // for group notification count
+                    }
                     shouldAdvance = true
                 }
             }
         }
         if (shouldAdvance) advanceQueue()
+        return accepted
     }
 
-    private fun isTaskIdActive(taskId: String): Boolean {
+    private suspend fun isTaskIdActive(taskId: String): Boolean {
         try {
-            val workInfos = workManager.getWorkInfosByTag("taskId=$taskId").get()
+            val workInfos = withContext(Dispatchers.IO) {
+                workManager.getWorkInfosByTag("taskId=$taskId").get()
+            }
             if (workInfos.any { !it.state.isFinished }) return true
 
             if (Build.VERSION.SDK_INT >= 34) {
@@ -272,10 +287,11 @@ class HoldingQueue(private val context: Context, private val workManager: WorkMa
      */
     private suspend fun executeTaskFinished(task: Task) {
         hostByTaskId.remove(task.taskId)
-        enqueuedTaskIds.remove(task.taskId)
         val host = task.host()
         val group = task.group
         stateMutex.withLock {
+            // under the mutex because [add] reads/writes this list under the same lock
+            enqueuedTaskIds.remove(task.taskId)
             concurrent.decrementAndGet()
             concurrentByHost[host]?.decrementAndGet()
             concurrentByGroup[group]?.decrementAndGet()
@@ -366,7 +382,7 @@ class EnqueueItem(
     val context: Context,
     val task: Task,
     val notificationConfigJsonString: String?,
-    private val resumeData: ResumeData? = null,
+    val resumeData: ResumeData? = null,
     private val plugin: BDPlugin? = null,
     private val created: Date = Date()
 ) : Comparable<EnqueueItem> {

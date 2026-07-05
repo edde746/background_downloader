@@ -720,7 +720,7 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
                 )
             } else {
                 Log.i(TAG, "Enqueueing task with id ${task.taskId} to the HoldingQueue")
-                holdingQueue?.add(
+                val accepted = holdingQueue?.add(
                     EnqueueItem(
                         context = applicationContext,
                         task = task,
@@ -728,14 +728,16 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
                         resumeData = resumeData,
                         plugin = this@BDPlugin
                     )
-                )
-                processStatusUpdate(
-                    task,
-                    TaskStatus.enqueued,
-                    PreferenceManager.getDefaultSharedPreferences(applicationContext),
-                    context = applicationContext
-                )
-                true
+                ) == true
+                if (accepted) {
+                    processStatusUpdate(
+                        task,
+                        TaskStatus.enqueued,
+                        PreferenceManager.getDefaultSharedPreferences(applicationContext),
+                        context = applicationContext
+                    )
+                }
+                accepted
             }
         }
 
@@ -786,7 +788,7 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
                         )
                     } else {
                         Log.i(TAG, "Enqueueing task with id ${task.taskId} to the HoldingQueue")
-                        holdingQueue?.add(
+                        val accepted = holdingQueue?.add(
                             EnqueueItem(
                                 context = applicationContext,
                                 task = task,
@@ -794,14 +796,16 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
                                 resumeData = null,
                                 plugin = plugin
                             )
-                        )
-                        processStatusUpdate(
-                            task,
-                            TaskStatus.enqueued,
-                            PreferenceManager.getDefaultSharedPreferences(applicationContext),
-                            context = applicationContext
-                        )
-                        true
+                        ) == true
+                        if (accepted) {
+                            processStatusUpdate(
+                                task,
+                                TaskStatus.enqueued,
+                                PreferenceManager.getDefaultSharedPreferences(applicationContext),
+                                context = applicationContext
+                            )
+                        }
+                        accepted
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "Error processing task ${task.taskId}: ${e.message}")

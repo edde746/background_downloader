@@ -84,15 +84,34 @@ void main() {
       final untrackedPart = File(
         '${tempDir.path}${Platform.pathSeparator}untracked.bin.part',
       );
-      final orphanPart = File(partialDownloadFilePath(orphanDest.path));
-      final referencedPart = File(partialDownloadFilePath(referencedDest.path));
-      final activePart = File(partialDownloadFilePath(activeDest.path));
-      final replacementPart =
-          File(partialDownloadFilePath(replacementDest.path));
+      final orphanPart = File(
+        partialDownloadFilePath(orphanDest.path, 'orphan-task'),
+      );
+      // legacy (pre-suffix) form of the same orphaned task: also cleaned up
+      final orphanLegacyPart = File(
+        legacyPartialDownloadFilePath(orphanDest.path),
+      );
+      final referencedPart = File(
+        partialDownloadFilePath(referencedDest.path, 'referenced-task'),
+      );
+      final activePart = File(
+        partialDownloadFilePath(activeDest.path, 'active-task'),
+      );
+      // legacy form actively written by a task resumed from a pre-suffix
+      // build; a different tracked task targets the same destination, so only
+      // the activePartPathKeys legacy entry protects this file
+      final activeLegacyPart = File(
+        legacyPartialDownloadFilePath(activeDest.path),
+      );
+      final replacementPart = File(
+        partialDownloadFilePath(replacementDest.path, 'replacement-active-task'),
+      );
       await Future.wait([
         orphanPart.writeAsString('orphan'),
+        orphanLegacyPart.writeAsString('orphan legacy'),
         referencedPart.writeAsString('referenced'),
         activePart.writeAsString('active'),
+        activeLegacyPart.writeAsString('active legacy'),
         replacementPart.writeAsString('replacement'),
         untrackedPart.writeAsString('untracked'),
       ]);
@@ -100,6 +119,7 @@ void main() {
       final orphanTask = _taskForFile('orphan-task', orphanDest);
       final referencedTask = _taskForFile('referenced-task', referencedDest);
       final activeTask = _taskForFile('active-task', activeDest);
+      final staleActiveTask = _taskForFile('stale-active-task', activeDest);
       final replacedTask = _taskForFile('replaced-task', replacementDest);
       final replacementActiveTask = _taskForFile(
         'replacement-active-task',
@@ -107,7 +127,13 @@ void main() {
       );
 
       final deleted = await deleteOrphanedPartialDownloadFiles(
-        trackedTasks: [orphanTask, referencedTask, activeTask, replacedTask],
+        trackedTasks: [
+          orphanTask,
+          referencedTask,
+          activeTask,
+          staleActiveTask,
+          replacedTask,
+        ],
         allResumeData: [
           ResumeData(referencedTask, referencedPart.path, 1, 'tag'),
         ],
@@ -118,17 +144,47 @@ void main() {
               Platform.isWindows ||
               Platform.isMacOS ||
               Platform.isLinux
-          ? 1
+          ? 2
           : 0;
       expect(deleted, expectedDeleted);
       expect(
         await orphanPart.exists(),
         expectedDeleted == 0 ? isTrue : isFalse,
       );
+      expect(
+        await orphanLegacyPart.exists(),
+        expectedDeleted == 0 ? isTrue : isFalse,
+      );
       expect(await referencedPart.exists(), isTrue);
       expect(await activePart.exists(), isTrue);
+      expect(await activeLegacyPart.exists(), isTrue);
       expect(await replacementPart.exists(), isTrue);
       expect(await untrackedPart.exists(), isTrue);
+    });
+  });
+
+  group('part file naming', () {
+    test('suffix is deterministic and unique per taskId', () {
+      expect(
+        partialDownloadFilePath('/dir/file.bin', 'A'),
+        partialDownloadFilePath('/dir/file.bin', 'A'),
+      );
+      expect(
+        partialDownloadFilePath('/dir/file.bin', 'A'),
+        isNot(partialDownloadFilePath('/dir/file.bin', 'B')),
+      );
+      expect(
+        partialDownloadFilePath('/dir/file.bin', 'A'),
+        isNot(legacyPartialDownloadFilePath('/dir/file.bin')),
+      );
+    });
+
+    test('FNV-1a golden vectors match the Kotlin implementation', () {
+      // these vectors are asserted identically in the Android unit test
+      // (PartFileSuffixTest); both implementations must never diverge
+      expect(partFileSuffix(''), '811c9dc5');
+      expect(partFileSuffix('a'), 'e40c292c');
+      expect(partFileSuffix('foobar'), 'bf9cf968');
     });
   });
 }

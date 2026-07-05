@@ -107,7 +107,7 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
                 deleteTempFile()
                 return TaskStatus.failed
             }
-            if (isResume && (eTagHeader != eTag || eTag?.subSequence(0, 1) == "W/")) {
+            if (isResume && (eTagHeader != eTag || eTag?.startsWith("W/") == true)) {
                 deleteTempFile()
                 Log.i(TAG, "Cannot resume: ETag is not identical, or is weak")
                 taskException = TaskException(
@@ -143,9 +143,9 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
             // determine tempFile, or set to null if Uri is used
             val tempFile = if (!usesUri) {
                 tempFilePath = if (isResume) {
-                    tempFilePath.ifEmpty { "$destFilePath.part" }
+                    tempFilePath.ifEmpty { partialDownloadFilePath(destFilePath, task.taskId) }
                 } else {
-                    "$destFilePath.part"
+                    partialDownloadFilePath(destFilePath, task.taskId)
                 }
                 val tempFile = File(tempFilePath)
                 tempFile.parentFile?.mkdirs()
@@ -217,8 +217,26 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
                         uriFilename = newFilename
                     }
                     task = task.copyWith(filename = UriUtils.pack(uriFilename, destUri))
-                    val os = resolver.openOutputStream(destUri, if (isResume) "wa" else "w")
+                    // "wa" (append) is optional in the SAF contract and some providers
+                    // reject it. A provider that silently truncates instead of appending
+                    // cannot be detected here.
+                    val os = try {
+                        resolver.openOutputStream(destUri, if (isResume) "wa" else "w")
+                    } catch (e: Exception) {
+                        Log.i(
+                            TAG,
+                            "Failed to open output stream for URI $destUri: ${e.message}"
+                        )
+                        null
+                    }
                     if (os == null) {
+                        if (isResume) {
+                            // The response is already streaming from the resume offset, so
+                            // we cannot switch to "w" here. Delete the partial document so
+                            // the next attempt restarts from scratch instead of failing on
+                            // append forever.
+                            deleteDestinationUri(destUri)
+                        }
                         val message = "Failed to open output stream for URI: $destUri"
                         Log.e(TAG, message)
                         taskException = TaskException(
@@ -418,8 +436,19 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
         tempFilePath = if (requiredStartByte > 0) context.getInputString(keyResumeDataData) ?: ""
         else ""
 
-        // SAF resume: resume data stores a content:// URI instead of a temp file path
         val resumeUri = Uri.parse(tempFilePath)
+        // file:// destination URI: the partial bytes live in the destination file
+        // itself, which supports regular file operations — convert to a plain path
+        // so the temp-file logic below (existence, truncation, deletion) applies
+        if (resumeUri.scheme == "file") {
+            tempFilePath = try {
+                resumeUri.toFile().path
+            } catch (e: IllegalArgumentException) {
+                Log.i(TAG, "Cannot resume from file URI $tempFilePath: ${e.message}")
+                return false
+            }
+        }
+        // SAF resume: resume data stores a content:// URI instead of a temp file path
         if (resumeUri.scheme == "content") {
             try {
                 val docFile = DocumentFile.fromSingleUri(context.appContext, resumeUri)
@@ -493,8 +522,32 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
                 return false
             }
             val range = contentRanges.first()
-            val matchResult = contentRangeRegex.find(range) ?: return false
-            startByte = matchResult.groups[1]?.value?.toLong()!! - taskRangeStartByte
+            val matchResult = contentRangeRegex.find(range)
+            if (matchResult == null) {
+                Log.i(TAG, "SAF resume: could not process Content-Range $range")
+                taskException = TaskException(
+                    ExceptionType.resume,
+                    description = "Could not process partial response Content-Range $range"
+                )
+                return false
+            }
+            val serverStart = matchResult.groups[1]?.value?.toLong()!!
+            // The document was opened in append mode, which cannot seek or truncate,
+            // so the server's range must start exactly where the partial file ends
+            if (serverStart != taskRangeStartByte + requiredStartByte) {
+                Log.i(
+                    TAG,
+                    "SAF resume: server range $range does not start at requested byte " +
+                            "${taskRangeStartByte + requiredStartByte}"
+                )
+                taskException = TaskException(
+                    ExceptionType.resume,
+                    description = "Cannot resume: server offered range $range instead of " +
+                            "requested start byte ${taskRangeStartByte + requiredStartByte}"
+                )
+                return false
+            }
+            startByte = serverStart - taskRangeStartByte
             return true
         }
         val contentRanges = connection.headerFields["Content-Range"]
@@ -564,15 +617,24 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
 
     /**
      * Deletes the temp file associated with this download
+     *
+     * During a SAF resume [tempFilePath] holds the content:// URI of the partial
+     * destination document, which a [File] delete cannot touch
      */
     private fun deleteTempFile() {
-        if (tempFilePath.isNotEmpty()) {
-            try {
-                val tempFile = File(tempFilePath)
-                tempFile.delete()
-            } catch (_: IOException) {
-                Log.i(TAG, "Could not delete temp file at $tempFilePath")
-            }
+        if (tempFilePath.isEmpty()) {
+            return
+        }
+        val uri = Uri.parse(tempFilePath)
+        if (uri.scheme == "content") {
+            deleteDestinationUri(uri)
+            return
+        }
+        try {
+            val tempFile = File(tempFilePath)
+            tempFile.delete()
+        } catch (_: IOException) {
+            Log.i(TAG, "Could not delete temp file at $tempFilePath")
         }
     }
 
