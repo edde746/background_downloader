@@ -1,3 +1,10 @@
+## 9.5.6
+
+* [Android] Timed-out tasks (9-minute WorkManager limit) and notification-action resumes now route their re-enqueue through the holding queue instead of past it. Previously each timeout/resume cycle ran the continuation outside the queue's accounting while the finished run freed a slot, permanently raising effective concurrency beyond `maxConcurrent`
+* [Android] Holding queue counters only decrement for tasks the queue actually promoted, and the queue's 10-second timer now recalculates state from WorkManager (restoring parity with iOS), so counter drift can no longer disable concurrency limits
+* [iOS] Notification-action resume routes through the holding queue, and counter accounting carries the same guard against unmatched finish reports
+* [Android/iOS] Canceling a task held in the holding queue now clears its enqueued-task marker, so the same taskId can be enqueued again later
+
 ## 9.5.5
 
 * [Android] Bug fixes and performance improvements (from upstream 9.5.5):

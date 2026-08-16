@@ -982,9 +982,14 @@ public class BDPlugin: NSObject, FlutterPlugin, UNUserNotificationCenterDelegate
                 }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                     _Concurrency.Task {
-                        if await(BDPlugin.instance.doEnqueue(taskJsonString: taskAsJsonString, notificationConfigJsonString: userInfo["notificationConfig"] as? String, resumeDataAsBase64String: resumeDataAsBase64String)) == false {
+                        if let holdingQueue = BDPlugin.holdingQueue {
+                            // Route the resume through the holding queue so the task
+                            // competes for a slot under maxConcurrent; a direct doEnqueue
+                            // would run it outside the queue's accounting
+                            await holdingQueue.add(item: EnqueueItem(task: task, notificationConfigJsonString: userInfo["notificationConfig"] as? String, resumeDataAsBase64String: resumeDataAsBase64String))
+                            processStatusUpdate(task: task, status: .enqueued)
+                        } else if await(BDPlugin.instance.doEnqueue(taskJsonString: taskAsJsonString, notificationConfigJsonString: userInfo["notificationConfig"] as? String, resumeDataAsBase64String: resumeDataAsBase64String)) == false {
                             os_log("Could not enqueue taskId %@ to resume", log: log, type: .info, task.taskId)
-                            await BDPlugin.holdingQueue?.taskFinished(task)
                         }
                     }
                 }

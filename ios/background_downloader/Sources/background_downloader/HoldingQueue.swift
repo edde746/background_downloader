@@ -31,6 +31,13 @@ class HoldingQueue {
     private var concurrent = 0
     private var concurrentByHost = [String: Int]()
     private var concurrentByGroup = [String: Int]()
+
+    // taskIds currently counted in concurrent/concurrentByHost/concurrentByGroup,
+    // populated on queue promotion and by calculateState. Guards taskFinished
+    // against decrementing for a task that was never counted (or was already
+    // finished once), which would drift concurrent negative and raise the
+    // effective concurrency
+    private var activeTaskIds = Set<String>()
     
     private var queue = [EnqueueItem]()  // Using an array as a substitute for a priority queue
     
@@ -64,9 +71,14 @@ class HoldingQueue {
             await stateLock.lock()
         }
         let host = getHost(task)
-        concurrent -= 1
-        concurrentByHost[host]? -= 1
-        concurrentByGroup[task.group]? -= 1
+        // Only adjust counters for a task this queue actually counted: finish
+        // reports also arrive for tasks that never went through promotion and
+        // could arrive twice for one promotion
+        if activeTaskIds.remove(task.taskId) != nil {
+            concurrent -= 1
+            concurrentByHost[host]? -= 1
+            concurrentByGroup[task.group]? -= 1
+        }
         if let index = enqueuedTaskIds.firstIndex(of: task.taskId) {
             enqueuedTaskIds.remove(at: index)
         }
@@ -91,6 +103,7 @@ class HoldingQueue {
             os_log("Canceled task with id %@", log: log, type: .info, item.task.taskId)
         }
         queue.removeAll(where: { taskIds.contains($0.task.taskId)})
+        enqueuedTaskIds.removeAll(where: { taskIds.contains($0) })
         return toRemove.map { $0.task.taskId }
     }
     
@@ -171,6 +184,7 @@ class HoldingQueue {
                     concurrent += 1
                     concurrentByHost[host, default: 0] += 1
                     concurrentByGroup[item.task.group, default: 0] += 1
+                    activeTaskIds.insert(item.task.taskId)
                     await item.enqueue()
                     break
                 } else {
@@ -200,6 +214,7 @@ class HoldingQueue {
         concurrent = tasks.count
         concurrentByHost.removeAll()
         concurrentByGroup.removeAll()
+        activeTaskIds = Set(tasks.map { $0.taskId })
         for task in tasks {
             let host = getHost(task)
             concurrentByHost[host, default: 0] += 1
