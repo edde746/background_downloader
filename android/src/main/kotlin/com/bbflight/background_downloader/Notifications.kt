@@ -346,6 +346,22 @@ class NotificationReceiver : BroadcastReceiver() {
         resumeData: ResumeData,
         notificationConfigJsonString: String?
     ) {
+        val holdingQueue = BDPlugin.holdingQueue
+        if (holdingQueue != null) {
+            // Route the resume through the holding queue so the task competes for
+            // a slot under maxConcurrent; a direct doEnqueue would run it outside
+            // the queue's accounting
+            holdingQueue.add(
+                EnqueueItem(
+                    context = context,
+                    task = resumeData.task,
+                    notificationConfigJsonString = notificationConfigJsonString,
+                    resumeData = resumeData
+                )
+            )
+            Log.i(TAG, "Queued taskId $taskId to resume")
+            return
+        }
         if (!BDPlugin.doEnqueue(
                 context,
                 resumeData.task,
@@ -354,9 +370,6 @@ class NotificationReceiver : BroadcastReceiver() {
             )
         ) {
             Log.i(TAG, "Could not enqueue taskId $taskId to resume")
-            BDPlugin.holdingQueue?.taskFinished(resumeData.task)
-        } else {
-            Log.i(TAG, "Resumed taskId $taskId from notification")
         }
     }
 }

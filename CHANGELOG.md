@@ -1,3 +1,18 @@
+## Fork changes (unreleased, on top of 9.6.2)
+
+* [Android] SAF (`content://`) and `file://` destinations now support pause/resume: resume data stores the destination URI and the download appends via `"wa"` mode, falling back to a fresh restart when the provider rejects append or the server returns a mismatched `Content-Range` offset
+* [Android] Timed-out tasks (9-minute WorkManager limit) and notification-action resumes now route their re-enqueue through the holding queue instead of past it. Previously each timeout/resume cycle ran the continuation outside the queue's accounting while the finished run freed a slot, permanently raising effective concurrency beyond `maxConcurrent`
+* [Android/iOS] Holding queue counters only decrement for tasks the queue actually promoted, and Android's 10-second timer recalculates state from WorkManager (restoring parity with iOS), so counter drift can no longer disable concurrency limits
+* [Android/iOS] Canceling a task held in the holding queue now clears its enqueued-task marker, so the same taskId can be enqueued again later
+* [Android] Duplicate task enqueues are de-duped: WorkManager enqueues use unique work names (`KEEP` for fresh tasks, `APPEND_OR_REPLACE` for resumes/retries), and the holding queue replaces queued duplicates and drops duplicates of already-active tasks
+* [Android/Desktop] Partial downloads use destination-local `<dest>.<taskId hash>.part` temp files instead of random names in the temp directory, eliminating cross-disk copies and temp-file orphans; legacy `.part` files still resume and are cleaned up
+* [Android/Desktop/iOS] Resume-data lifecycle cleanup: stale resume data is discarded when a task is re-enqueued or reaches a final state, orphaned temp files are swept on a delay (protected while the owning task is active), and `cleanUpOrphanedTempFiles` covers Android and desktop
+* [Desktop] Temp file writes fall back to a hidden file in the target directory when the temp directory is not writable, and a task canceled before its isolate starts exits cleanly instead of leaking
+* [Desktop] Final progress updates are synthesized centrally in `BaseDownloader.processStatusUpdate`, guaranteeing exactly one terminal progress event per final status
+* [Android/iOS] Downloads and parallel downloads stop before device storage is exhausted: free space is checked before starting and monitored during transfer, failing with a storage error instead of filling the disk
+* [Linux/Desktop] A host without a documents directory (missing `xdg-user-dirs`) no longer hangs startup: the Localstore migration treats it as nothing to migrate and `BaseDownloader.initialize` settles `ready` even when storage init fails
+* [Android] `Config.tempFilePath` is honored for the `.part` file location when set
+
 ## 9.6.2
 
 * Fix task updates stream suppression when task tracking or transfers is enabled: isolate internal `Transfers` callbacks from user-registered callbacks using dedicated `groupTransfer` callback maps in `BaseDownloader`, preventing internal callbacks from suppressing events on `FileDownloader().updates`, and preserving callback reference equality in `registerCallbacks`/`unregisterCallbacks` (fixes #727)

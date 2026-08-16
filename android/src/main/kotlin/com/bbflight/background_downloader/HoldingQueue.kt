@@ -49,6 +49,13 @@ class HoldingQueue(private val context: Context, private val workManager: WorkMa
     private val concurrentByHost = ConcurrentHashMap<String, AtomicInteger>()
     private val concurrentByGroup = ConcurrentHashMap<String, AtomicInteger>()
 
+    // taskIds currently counted in [concurrent]/[concurrentByHost]/[concurrentByGroup],
+    // populated on queue promotion and by [calculateState]. Guards [executeTaskFinished]
+    // against decrementing for a task that was never counted (or was already finished
+    // once), which would drift [concurrent] negative and permanently raise the
+    // effective concurrency
+    private val activeTaskIds: MutableSet<String> = ConcurrentHashMap.newKeySet()
+
     private val queue = PriorityBlockingQueue<EnqueueItem>()
     private val taskFinishedQueue = Channel<Task>(capacity = Channel.UNLIMITED)
 
@@ -76,6 +83,7 @@ class HoldingQueue(private val context: Context, private val workManager: WorkMa
                             concurrent.incrementAndGet()
                             concurrentByHost.computeIfAbsent(host) { AtomicInteger(0) }.incrementAndGet()
                             concurrentByGroup.computeIfAbsent(group) { AtomicInteger(0) }.incrementAndGet()
+                            activeTaskIds.add(item.task.taskId)
                             item.enqueue(afterDelayMillis = 0)
                         } else {
                             // this item has to wait
@@ -197,6 +205,7 @@ class HoldingQueue(private val context: Context, private val workManager: WorkMa
         val prefs = PreferenceManager.getDefaultSharedPreferences(context)
         toRemove.forEach {
             queue.remove(it)
+            enqueuedTaskIds.remove(it.task.taskId)
             TaskWorker.processStatusUpdate(it.task, TaskStatus.canceled, prefs, context = context)
             if (it.notificationConfigJsonString != null) {
                 NotificationService.createUpdateNotificationWorker(
@@ -275,6 +284,9 @@ class HoldingQueue(private val context: Context, private val workManager: WorkMa
         job?.cancel()
         job = scope.launch {
             delay(10000)
+            // recalculate state from the OS view (iOS does the same); heals any
+            // residual counter drift while the queue is active
+            calculateState()
             advanceQueue()
         }
     }
@@ -291,18 +303,26 @@ class HoldingQueue(private val context: Context, private val workManager: WorkMa
         stateMutex.withLock {
             // under the mutex because [add] reads/writes this list under the same lock
             enqueuedTaskIds.remove(task.taskId)
-            concurrent.decrementAndGet()
-            concurrentByHost[host]?.decrementAndGet()
-            concurrentByGroup[group]?.decrementAndGet()
+            // Only adjust counters for a task this queue actually counted: finish
+            // reports also arrive for tasks that never went through promotion (e.g.
+            // enqueued before the queue was configured) and could arrive twice for
+            // one promotion (pause of a run that re-enqueued itself). Unconditional
+            // decrements drift [concurrent] negative and break maxConcurrent
+            if (activeTaskIds.remove(task.taskId)) {
+                concurrent.decrementAndGet()
+                concurrentByHost[host]?.decrementAndGet()
+                concurrentByGroup[group]?.decrementAndGet()
+            }
         }
         advanceQueue()
     }
 
     /**
      * Calculates the [concurrent], [concurrentByHost] and [concurrentByGroup] values
+     * and rebuilds [activeTaskIds] from the observed jobs
      *
-     * This is expensive, so is only done initially and when the [advanceQueueInFuture] timer
-     * fires
+     * This is expensive, so is only done when the queue is created and when the
+     * [advanceQueueInFuture] timer fires
      */
     private suspend fun calculateState() {
         stateMutex.withLock {
@@ -311,11 +331,13 @@ class HoldingQueue(private val context: Context, private val workManager: WorkMa
             var totalCount = workInfos.size
             concurrentByHost.clear()
             concurrentByGroup.clear()
+            activeTaskIds.clear()
             for (workInfo in workInfos) {
                 // update concurrentByHost
                 try {
                     val taskIdTag = workInfo.tags.first { it.startsWith("taskId=") }
                     val taskId = taskIdTag.substring(startIndex = 7)
+                    activeTaskIds.add(taskId)
                     val host = hostByTaskId[taskId] ?: ""
                     if (!concurrentByHost.containsKey(host)) {
                         concurrentByHost[host] = AtomicInteger(0)
@@ -345,6 +367,7 @@ class HoldingQueue(private val context: Context, private val workManager: WorkMa
                               try {
                                   val task = bdJson.decodeFromString<Task>(taskJson)
                                   totalCount++
+                                  activeTaskIds.add(task.taskId)
                                   
                                   val host = task.host()
                                   val group = task.group

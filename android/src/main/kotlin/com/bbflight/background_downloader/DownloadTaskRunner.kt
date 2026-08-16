@@ -365,16 +365,35 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
                     if (taskCanResume) {
                         Log.i(
                             TAG,
-                            "Task ${task.taskId} paused due to timeout, will resume in 1 second"
+                            "Task ${task.taskId} paused due to timeout, will resume"
                         )
                         val start = bytesTotal + startByte
-                        val success = BDPlugin.doEnqueue(
-                            context.appContext,
-                            task,
-                            notificationConfigJsonString,
-                            ResumeData(task, resumeDataPath(), start, eTagHeader),
-                            1000
-                        )
+                        val resumeData = ResumeData(task, resumeDataPath(), start, eTagHeader)
+                        val holdingQueue = BDPlugin.holdingQueue
+                        val success = if (holdingQueue != null) {
+                            // Route the resume through the holding queue: a direct
+                            // doEnqueue would run the continuation outside the queue's
+                            // accounting, while this run's finish report frees a slot —
+                            // every timeout cycle would raise effective concurrency past
+                            // maxConcurrent. compareTo orders by the task's original
+                            // creation time, so the resume goes to the front, not the back
+                            holdingQueue.add(
+                                EnqueueItem(
+                                    context = context.appContext,
+                                    task = task,
+                                    notificationConfigJsonString = notificationConfigJsonString,
+                                    resumeData = resumeData
+                                )
+                            )
+                        } else {
+                            BDPlugin.doEnqueue(
+                                context.appContext,
+                                task,
+                                notificationConfigJsonString,
+                                resumeData,
+                                1000
+                            )
+                        }
                         if (!success) {
                             Log.w(TAG, "Task ${task.taskId} timed out and could not re-enqueue to resume")
                             taskException = TaskException(
