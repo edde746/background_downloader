@@ -157,9 +157,18 @@ abstract base class BaseDownloader {
   /// Initializes the PersistentStorage instance and if necessary perform database
   /// migration, starts listening for database update commands and
   /// then initializes the subclassed implementation for desktop or native
+  ///
+  /// [ready] settles either way: this runs unawaited from [BaseDownloader.instance],
+  /// so a storage that fails to initialize (a migration that could not resolve
+  /// a platform directory) must not leave every caller of [trackTasks] and the
+  /// other `await ready` sites waiting forever.
   @mustCallSuper
   Future<void> initialize() async {
-    await _storage.initialize();
+    try {
+      await _storage.initialize();
+    } catch (e, stackTrace) {
+      log.warning('PersistentStorage initialization failed: $e', e, stackTrace);
+    }
     _databaseUpdates.stream
         .asyncMap((data) async {
           await _consumeUpdateTaskInDatabase(

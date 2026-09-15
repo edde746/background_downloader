@@ -508,8 +508,17 @@ class _LocalStorePersistentStorageExecutor {
     );
     switch (storedVersion) {
       case 0:
-        // move files from docDir to supportDir
-        final docDir = await getApplicationDocumentsDirectory();
+        // move files from docDir to supportDir. A host that cannot name a
+        // documents directory (Linux without the xdg-user-dirs binary,
+        // which path_provider shells out to) has nothing there to move;
+        // the store lives in the support directory either way.
+        final Directory docDir;
+        try {
+          docDir = await getApplicationDocumentsDirectory();
+        } on MissingPlatformDirectoryException catch (e) {
+          log.fine('No documents directory to migrate from: $e');
+          break;
+        }
         final supportDir = await getApplicationSupportDirectory();
         await Future.wait(
           [resumeDataPath, pausedTasksPath, taskRecordsPath].map((path) async {
