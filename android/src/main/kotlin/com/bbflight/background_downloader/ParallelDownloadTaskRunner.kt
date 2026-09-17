@@ -1,5 +1,6 @@
 package com.bbflight.background_downloader
 
+import android.system.Os
 import android.util.Log
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
@@ -332,38 +333,59 @@ class ParallelDownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) 
      */
     private suspend fun stitchChunks(): TaskStatus {
         return withContext(Dispatchers.IO) {
+            var outFile: File? = null
             try {
                 val dataBuffer = ByteArray(bufferSize)
                 var numBytes: Int
-                val outFile = File(task.filePath(context.appContext))
-                if (outFile.exists()) {
-                    outFile.delete()
-                }
-                FileOutputStream(outFile).use { outStream ->
-                    for (chunk in chunks.sortedBy { it.fromByte }) {
-                        val inFile = File(chunk.task.filePath(context.appContext))
-                        if (!inFile.exists()) {
-                            throw java.io.FileNotFoundException("Missing chunk file: ${inFile.path}")
-                        }
-                        FileInputStream(inFile).use { inStream ->
-                            while (inStream.read(
-                                    dataBuffer, 0,
-                                    bufferSize
-                                )
-                                    .also { numBytes = it } != -1
-                            ) {
-                                outStream.write(dataBuffer, 0, numBytes)
+                outFile = File(task.filePath(context.appContext))
+                // Stitch into a staging file so a failure never touches any completed file,
+                // then rename(2) it into place (same volume, atomic).
+                val staging = File(outFile.parentFile, ".${outFile.name}.stitch.part")
+                try {
+                    FileOutputStream(staging).use { rawOutput ->
+                        val guardedOutput = guardedDownloadOutput(
+                            context.appContext, rawOutput, parallelDownloadContentLength
+                        ) { staging.delete() }
+                        try {
+                            for (chunk in chunks.sortedBy { it.fromByte }) {
+                                val inFile = File(chunk.task.filePath(context.appContext))
+                                if (!inFile.exists()) {
+                                    throw java.io.FileNotFoundException(
+                                        "Missing chunk file: ${inFile.path}"
+                                    )
+                                }
+                                FileInputStream(inFile).use { inStream ->
+                                    while (inStream.read(
+                                            dataBuffer, 0,
+                                            bufferSize
+                                        )
+                                            .also { numBytes = it } != -1
+                                    ) {
+                                        guardedOutput.write(dataBuffer, 0, numBytes)
+                                    }
+                                }
                             }
+                            guardedOutput.flush()
+                        } finally {
+                            guardedOutput.close()
                         }
                     }
-                    outStream.flush()
+                    Os.rename(staging.path, outFile.path)
+                } finally {
+                    staging.delete()
                 }
             } catch (e: Exception) {
                 Log.i(TAG, "Error stitching chunks: $e\n${e.stackTraceToString()}")
-                taskException = TaskException(
-                    ExceptionType.fileSystem,
-                    description = "Error stitching chunks: $e"
-                )
+                taskException = if (isDownloadStorageFailure(e.message)) {
+                    // Failure to create the output is not resumable; the guard already
+                    // removed the staged partial. Chunk files are deleted in the finally below.
+                    TaskException(ExceptionType.fileSystem, description = e.message.orEmpty())
+                } else {
+                    TaskException(
+                        ExceptionType.fileSystem,
+                        description = "Error stitching chunks: $e"
+                    )
+                }
                 return@withContext TaskStatus.failed
             } finally {
                 for (chunk in chunks) {

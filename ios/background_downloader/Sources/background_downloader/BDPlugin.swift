@@ -42,7 +42,6 @@ public class BDPlugin: NSObject, FlutterPlugin, UNUserNotificationCenterDelegate
     static var taskIdsRequiringWiFi = Set<String>() // ensures correctness when enqueueing task
     static var notificationConfigJsonStrings = [String:String]() // by taskId
     static var localResumeData = [String : String]() // locally stored to enable notification resume
-    static var remainingBytesToDownload = [String : Int64]()  // keyed by taskId
     static var responseBodyData = [String: [Data]]() // list of Data objects received for this UploadTask id
     static var tasksWithModifications = [String : Task]() // [taskId : Task with suggested filename]
     static var tasksWithContentLengthOverride = [String : Int64]() // [taskId : Content length]
@@ -333,6 +332,17 @@ public class BDPlugin: NSObject, FlutterPlugin, UNUserNotificationCenterDelegate
             request.httpBody = Data((task.post ?? "").data(using: .utf8)!)
         }
         let urlSessionDownloadTask = resumeData == nil ? UrlSessionDelegate.urlSession!.downloadTask(with: request) : UrlSessionDelegate.urlSession!.downloadTask(withResumeData: resumeData!)
+        do {
+            try checkDownloadStorage(task: task, expected: resumeData == nil
+                ? getContentLength(responseHeaders: [:], task: task) : -1)
+        } catch {
+            // Let URLSession dispose of any resume-file it owns. No task
+            // description is attached yet, so cancellation emits no second status.
+            urlSessionDownloadTask.cancel()
+            await postEnqueuedStatusIfNotAlreadyDone(task: task, notificationConfigJsonString: notificationConfigJsonString)
+            processStatusUpdate(task: task, status: .failed, taskException: storageException(error))
+            return true
+        }
         urlSessionDownloadTask.taskDescription = taskDescription
         urlSessionDownloadTask.priority = 1 - Float(task.priority) / 10
         urlSessionDownloadTask.resume()

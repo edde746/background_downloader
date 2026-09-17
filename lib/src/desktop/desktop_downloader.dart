@@ -49,6 +49,7 @@ final class DesktopDownloader extends BaseDownloader {
   static var _mtlsConfigs = <MTLSConfig>[];
   static int _skipExistingFiles = -1;
   static String? tempFilePath;
+  static int checkAvailableSpace = 0;
 
   factory() => _singleton;
 
@@ -204,6 +205,7 @@ final class DesktopDownloader extends BaseDownloader {
       _mtlsConfigs,
       tempFilePath,
       wasCanceledBeforeSendPort,
+      checkAvailableSpace,
     ));
     // listen for messages sent back from the isolate, until 'done'
     // note that the task sent by the isolate may have changed. Therefore, we
@@ -605,6 +607,16 @@ final class DesktopDownloader extends BaseDownloader {
   @override
   Future<(String, String)> configureItem((String, dynamic) configItem) async {
     switch (configItem) {
+      case (Config.checkAvailableSpace, true):
+        checkAvailableSpace = -1;
+
+      case (Config.checkAvailableSpace, false):
+      case (Config.checkAvailableSpace, Config.never):
+        checkAvailableSpace = 0;
+
+      case (Config.checkAvailableSpace, int value) when value >= -1:
+        checkAvailableSpace = value;
+
       case (Config.requestTimeout, final Duration? duration):
         requestTimeout = duration;
 

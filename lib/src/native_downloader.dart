@@ -534,6 +534,12 @@ abstract base class NativeDownloader extends BaseDownloader {
           null,
         );
 
+      case (Config.checkAvailableSpace, true):
+        await NativeDownloader.methodChannel.invokeMethod(
+          'configCheckAvailableSpace',
+          -1,
+        );
+
       case (Config.checkAvailableSpace, final int minimum):
         assert(minimum > 0, 'Minimum available space must be in MB and > 0');
         await NativeDownloader.methodChannel.invokeMethod(

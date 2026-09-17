@@ -2,6 +2,7 @@ package com.bbflight.background_downloader
 
 import android.net.Uri
 import android.os.Build
+import android.os.ParcelFileDescriptor
 import android.util.Log
 import androidx.core.net.toFile
 import androidx.documentfile.provider.DocumentFile
@@ -16,8 +17,6 @@ import java.io.IOException
 import java.io.RandomAccessFile
 import java.net.HttpURLConnection
 import java.nio.channels.FileChannel
-import java.nio.file.Files
-import java.nio.file.StandardCopyOption
 import java.nio.file.StandardOpenOption
 import android.system.Os
 import android.system.ErrnoException
@@ -41,7 +40,7 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
 
     /** For SAF downloads, resume data stores the destUri; otherwise the temp file path. */
     private fun resumeDataPath(): String =
-        safDestUri?.toString() ?: tempFilePath
+        if (usesUri) safDestUri?.toString() ?: tempFilePath else tempFilePath
 
     /**
      * Make the request to the [connection] and process the [Task]
@@ -91,7 +90,7 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
         responseStatusCode = connection.responseCode
         if (connection.responseCode in 200..206) {
             val directoryUri = UriUtils.uriFromStringValue(task.directory)
-            usesUri = directoryUri != null
+            usesUri = directoryUri != null && directoryUri.scheme != "file"
             eTagHeader = connection.headerFields["ETag"]?.first()
             val acceptRangesHeader = connection.headerFields["Accept-Ranges"]
             serverAcceptsRanges =
@@ -138,6 +137,13 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
                     destFilePath = destFilePath(connection)
                 }
             }
+            if (directoryUri?.scheme == "file") {
+                val fileDestination = destUri?.toFile()
+                    ?: File(directoryUri.toFile(), uriFilename ?: task.filename)
+                destFilePath = fileDestination.path
+                destUri = Uri.fromFile(fileDestination)
+                task = task.copyWith(filename = UriUtils.pack(fileDestination.name, destUri))
+            }
             extractResponseHeaders(connection.headerFields)
             extractContentType(connection.headerFields)
             val contentLength = getContentLength(connection.headerFields, task)
@@ -158,56 +164,27 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
                 val tempFile = File(tempFilePath)
                 tempFile.parentFile?.mkdirs()
 
-                // confirm enough storage space for download
-                if (insufficientSpace(context.appContext, contentLength, tempFile)) {
-                    Log.i(
-                        TAG,
-                        "Insufficient space to store the file to be downloaded for taskId ${task.taskId}"
-                    )
-                    taskException = TaskException(
-                        ExceptionType.fileSystem,
-                        description = "Insufficient space to store the file to be downloaded"
-                    )
-                    return TaskStatus.failed
-                }
                 tempFile
             } else {
                 null
             }
-            val outputStream: java.io.OutputStream = if (tempFile != null) {
+            val outputStream: FileOutputStream = if (tempFile != null) {
                 FileOutputStream(tempFile, isResume)
             } else {
                 // no tempFile, because we have a Uri
                 uriFilename = uriFilename ?: "unknown"
-                if (directoryUri!!.scheme == "file") {
-                    // fileUri is converted to a File, then to a FileOutputStream
-                    if (destUri == null) {
-                        // need to create file at directory
-                        val dirObject = directoryUri.toFile()
-                        val destFile = File(dirObject, uriFilename)
-                        destUri = Uri.fromFile(destFile)
-                        // Store destination Uri in task
-                        task = task.copyWith(filename = UriUtils.pack(uriFilename, destUri))
-                        FileOutputStream(destFile, isResume) // return outputStream
-                    } else {
-                        // use destination Uri that was set in previous attempt
-                        FileOutputStream(destUri.toFile(), isResume)
-                    }
-                } else {
                     // other URL scheme will be attempted to resolve using content resolver
                     val resolver = context.appContext.contentResolver
                     val targetFilename = uriFilename ?: "unknown"
                     // create destination Uri if not already exists
-                    val documentFile = DocumentFile.fromTreeUri(context.appContext, directoryUri)
+                    val documentFile = DocumentFile.fromTreeUri(context.appContext, directoryUri!!)
                     if (destUri != null && !safFileExists(destUri)) {
                         Log.i(TAG, "Ignoring stale SAF destination Uri $destUri")
                         destUri = null
                     }
-                    val shouldReuseSafFile =
-                        task.retriesRemaining < task.retries || requiredStartByte > 0
-                    if (destUri == null && shouldReuseSafFile) {
-                        destUri = findSafFile(documentFile, targetFilename)
-                    }
+                    // Only a URI recorded for this task's partial output may be reused.
+                    // Never adopt an unrelated document just because its filename matches.
+                    if (!isResume && task.retriesRemaining == task.retries) destUri = null
                     destUri = destUri
                         ?: documentFile?.createFile(task.mimeType, targetFilename)?.uri
                     if (destUri == null) {
@@ -228,16 +205,16 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
                     // "wa" (append) is optional in the SAF contract and some providers
                     // reject it. A provider that silently truncates instead of appending
                     // cannot be detected here.
-                    val os = try {
-                        resolver.openOutputStream(destUri, if (isResume) "wa" else "w")
+                    val descriptor = try {
+                        resolver.openFileDescriptor(destUri, if (isResume) "wa" else "wt")
                     } catch (e: Exception) {
                         Log.i(
                             TAG,
-                            "Failed to open output stream for URI $destUri: ${e.message}"
+                            "Failed to open output descriptor for URI $destUri: ${e.message}"
                         )
                         null
                     }
-                    if (os == null) {
+                    if (descriptor == null) {
                         if (isResume) {
                             // The response is already streaming from the resume offset, so
                             // we cannot switch to "w" here. Delete the partial document so
@@ -245,30 +222,29 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
                             // append forever.
                             deleteDestinationUri(destUri)
                         }
-                        val message = "Failed to open output stream for URI: $destUri"
+                        val message = "Failed to open output descriptor for URI: $destUri"
                         Log.e(TAG, message)
                         taskException = TaskException(
                             ExceptionType.fileSystem,
                             description = message
                         )
                         return TaskStatus.failed
-                    } else os
-                }
+                    } else ParcelFileDescriptor.AutoCloseOutputStream(descriptor)
             }
             // Store destUri for use by resumeDataPath() in pause/failure handlers
             safDestUri = destUri
-            BDPlugin.remainingBytesToDownload[task.taskId] = contentLength
             determineRunInForeground(task, contentLength) // sets 'runInForeground'
             context.updateEstimatedNetworkBytes(contentLength, 0L)
             // transfer the bytes from the server to the output stream
-            val transferBytesResult: TaskStatus
-            BufferedInputStream(connection.inputStream).use { inputStream ->
-                transferBytesResult = transferBytes(
-                    inputStream, outputStream, contentLength, task
-                )
+            val transferBytesResult = outputStream.use { rawOutput ->
+                guardedDownloadOutput(context.appContext, rawOutput, contentLength) {
+                    cleanup(usesUri, destUri)
+                }.use { guardedOutput ->
+                    BufferedInputStream(connection.inputStream).use { inputStream ->
+                        transferBytes(inputStream, guardedOutput, contentLength, task)
+                    }
+                }
             }
-            outputStream.flush()
-            outputStream.close()
             // act on the result of the bytes transfer
             when (transferBytesResult) {
                 TaskStatus.complete -> {
@@ -283,31 +259,8 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
                         if (!dir.exists()) {
                             dir.mkdirs()
                         }
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                            try {
-                                withContext(Dispatchers.IO) {
-                                    Files.move(
-                                        tempFile.toPath(),
-                                        destFile.toPath(),
-                                        StandardCopyOption.REPLACE_EXISTING
-                                    )
-                                }
-                            } catch (e: IOException) {
-                                Log.i(TAG, "Rename failed; copying temp file instead: ${e.message}")
-                                tempFile.copyTo(destFile, overwrite = true)
-                                deleteTempFile()
-                            }
-                            setFileOwnership(destFile)
-                        } else {
-                            if (destFile.exists()) {
-                                destFile.delete()
-                            }
-                            if (!tempFile.renameTo(destFile)) {
-                                tempFile.copyTo(destFile, overwrite = true)
-                                deleteTempFile()
-                            }
-                            setFileOwnership(destFile)
-                        }
+                        moveCompletedDownload(tempFile, destFile)
+                        setFileOwnership(destFile)
                         Log.i(
                             TAG, "Successfully downloaded taskId ${task.taskId} to $destFilePath"
                         )
@@ -438,6 +391,32 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
                 TaskStatus.notFound
             } else {
                 TaskStatus.failed
+            }
+        }
+    }
+
+
+    private suspend fun moveCompletedDownload(source: File, destination: File) {
+        withContext(Dispatchers.IO) {
+            try {
+                // rename(2) never silently copies across filesystems and atomically replaces.
+                Os.rename(source.path, destination.path)
+            } catch (renameError: ErrnoException) {
+                if (renameError.errno != android.system.OsConstants.EXDEV) throw renameError
+                val staging = File.createTempFile(".download-", ".part", destination.parentFile)
+                try {
+                    FileOutputStream(staging).use { rawOutput ->
+                        guardedDownloadOutput(context.appContext, rawOutput, source.length()) {
+                            staging.delete()
+                        }.use { guardedOutput ->
+                            source.inputStream().use { it.copyTo(guardedOutput, 64 * 1024) }
+                        }
+                    }
+                    Os.rename(staging.path, destination.path)
+                    source.delete()
+                } finally {
+                    staging.delete()
+                }
             }
         }
     }
@@ -638,6 +617,13 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
      * If this is not possible, the temp file will be deleted
      */
     private suspend fun prepResumeAfterFailure() {
+        if (isDownloadStorageFailure(taskException?.description)) {
+            task.retriesRemaining = 0
+            taskCanResume = false
+            BDPlugin.localResumeData.remove(task.taskId)
+            cleanup(usesUri, safDestUri)
+            return
+        }
         if (serverAcceptsRanges && bytesTotal + startByte > 1 shl 20) {
             // if failure can be resumed, post resume data
             processResumeData(
@@ -686,24 +672,14 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
         }
     }
 
-    /** Find an existing SAF file by name so retries overwrite instead of auto-number. */
-    private fun findSafFile(directory: DocumentFile?, filename: String): Uri? {
-        if (directory == null) return null
-        return try {
-            val file = directory.findFile(filename)
-            if (file?.isFile == true) file.uri else null
-        } catch (e: Exception) {
-            Log.i(TAG, "Could not find SAF file $filename: ${e.message}")
-            null
-        }
-    }
 
     /**
      * Deletes the destination Uri at [uri]
      */
     private fun deleteDestinationUri(uri: Uri) {
         try {
-            context.appContext.contentResolver.delete(uri, null, null)
+            if (uri.scheme == "file") uri.toFile().delete()
+            else context.appContext.contentResolver.delete(uri, null, null)
         } catch (_: Exception) {
             Log.i(TAG, "Could not delete file at $uri")
         }

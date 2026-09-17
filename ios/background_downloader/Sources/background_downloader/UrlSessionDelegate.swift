@@ -16,6 +16,18 @@ public class UrlSessionDelegate : NSObject, URLSessionDelegate, URLSessionDownlo
     public static var sessionIdentifier = "com.bbflight.background_downloader.Downloader"
     public static var backgroundCompletionHandler: (() -> Void)?
     
+    private var storageFailures = [Int: TaskException]()
+
+    private func cancelForStorage(_ downloadTask: URLSessionTask, error: Error) {
+        let shouldCancel = BDPlugin.propertyLock.withLock {
+            guard storageFailures[downloadTask.taskIdentifier] == nil else { return false }
+            storageFailures[downloadTask.taskIdentifier] = storageException(error)
+            return true
+        }
+        guard shouldCancel else { return }
+        // Do not request resume data: URLSession owns and discards the partial.
+        downloadTask.cancel()
+    }
     //MARK: URLSessionTaskDelegate
     
     /// Called before the task starts, and may continue, cancel or modify the original request, based on native callbacks in the [TaskOptions] of the task
@@ -23,6 +35,13 @@ public class UrlSessionDelegate : NSObject, URLSessionDelegate, URLSessionDownlo
         guard let bgdTask = getTaskFrom(urlSessionTask: task)
         else {
             return (.continueLoading, nil)
+        }
+        do {
+            try checkDownloadStorage(task: bgdTask, expected: task.countOfBytesExpectedToReceive,
+                                     written: task.countOfBytesReceived)
+        } catch {
+            cancelForStorage(task, error: error)
+            return (.cancel, nil)
         }
         // check & process beforeTaskStartCallback and cancel the task if returned value is not nil
         if bgdTask.options?.hasBeforeStartCallback() == true {
@@ -114,6 +133,17 @@ public class UrlSessionDelegate : NSObject, URLSessionDelegate, URLSessionDownlo
         let taskWasProgramaticallyCanceledAfterStart = BDPlugin.propertyLock.withLock( {
             BDPlugin.taskIdsProgrammaticallyCanceledAfterStart.remove(bgdTask.taskId) != nil
         })
+        if let failure = BDPlugin.propertyLock.withLock({ storageFailures.removeValue(forKey: task.taskIdentifier) }) {
+            processStatusUpdate(task: bgdTask, status: .failed, taskException: failure)
+            updateNotification(task: bgdTask, notificationType: .error, notificationConfig: notificationConfig)
+            return
+        }
+        if isDownloadTask(task: bgdTask), let error = error,
+           isStorageFailure(storageException(error)) {
+            processStatusUpdate(task: bgdTask, status: .failed, taskException: storageException(error))
+            updateNotification(task: bgdTask, notificationType: .error, notificationConfig: notificationConfig)
+            return
+        }
         guard error == nil else {
             var notificationType = taskWasProgramaticallyCanceledAfterStart ? nil : NotificationType.error
             // handle the error if this task wasn't programatically cancelled (in which
@@ -188,6 +218,7 @@ public class UrlSessionDelegate : NSObject, URLSessionDelegate, URLSessionDownlo
     public func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didWriteData bytesWritten: Int64, totalBytesWritten: Int64, totalBytesExpectedToWrite: Int64) {
         // task is var because the filename can be changed on the first 'didWriteData' call
         guard var task = getTaskFrom(urlSessionTask: downloadTask) else { return }
+        guard BDPlugin.propertyLock.withLock({ storageFailures[downloadTask.taskIdentifier] == nil }) else { return }
         let progressInfo = BDPlugin.propertyLock.withLock({
             BDPlugin.progressInfo[task.taskId]
         })
@@ -237,21 +268,6 @@ public class UrlSessionDelegate : NSObject, URLSessionDelegate, URLSessionDownlo
                         })
                     }
                 }
-                // Check if there is enough space
-                if insufficientSpace(contentLength: totalBytesExpectedToWrite) {
-                    let notProgrammaticallyCancelled = BDPlugin.propertyLock.withLock({
-                        !BDPlugin.taskIdsProgrammaticallyCanceledAfterStart.contains(task.taskId)
-                    })
-                    if notProgrammaticallyCancelled {
-                        os_log("Error for taskId %@: Insufficient space to store the file to be downloaded", log: log, type: .error, task.taskId)
-                        processStatusUpdate(task: task, status: .failed, taskException: TaskException(type: .fileSystem, httpResponseCode: -1, description: "Insufficient space to store the file to be downloaded for taskId \(task.taskId)"))
-                        BDPlugin.propertyLock.withLock({
-                            _ = BDPlugin.taskIdsProgrammaticallyCanceledAfterStart.insert(task.taskId)
-                        })
-                        downloadTask.cancel()
-                    }
-                    return
-                }
                 // check if the task is resumable
                 if task.allowPause {
                     let acceptRangesHeader = (downloadTask.response as? HTTPURLResponse)?.allHeaderFields["Accept-Ranges"]
@@ -266,11 +282,25 @@ public class UrlSessionDelegate : NSObject, URLSessionDelegate, URLSessionDownlo
             }
         }
         let contentLength = BDPlugin.propertyLock.withLock({
-            let l = totalBytesExpectedToWrite != -1 ? totalBytesExpectedToWrite : BDPlugin.tasksWithContentLengthOverride[task.taskId] ?? -1
-            BDPlugin.remainingBytesToDownload[task.taskId] = l - totalBytesWritten
-            return l
+            totalBytesExpectedToWrite != -1 ? totalBytesExpectedToWrite : BDPlugin.tasksWithContentLengthOverride[task.taskId] ?? -1
         })
+        do {
+            try checkDownloadStorage(task: task, expected: contentLength, written: totalBytesWritten)
+        } catch {
+            cancelForStorage(downloadTask, error: error)
+            return
+        }
         updateProgress(task: task, totalBytesExpected: contentLength, totalBytesDone: totalBytesWritten)
+    }
+
+    public func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
+                           didResumeAtOffset fileOffset: Int64, expectedTotalBytes: Int64) {
+        guard let task = getTaskFrom(urlSessionTask: downloadTask) else { return }
+        do {
+            try checkDownloadStorage(task: task, expected: expectedTotalBytes, written: fileOffset)
+        } catch {
+            cancelForStorage(downloadTask, error: error)
+        }
     }
     
     /// Process taskdelegate progress update for upload task
@@ -306,6 +336,10 @@ public class UrlSessionDelegate : NSObject, URLSessionDelegate, URLSessionDownlo
     public func urlSession(_ session: URLSession,
                            downloadTask: URLSessionDownloadTask,
                            didFinishDownloadingTo location: URL) {
+        if BDPlugin.propertyLock.withLock({ storageFailures[downloadTask.taskIdentifier] != nil }) {
+            try? FileManager.default.removeItem(at: location)
+            return
+        }
         guard var task = getTaskFrom(urlSessionTask: downloadTask),
               let response = downloadTask.response as? HTTPURLResponse
         else {
@@ -351,7 +385,7 @@ public class UrlSessionDelegate : NSObject, URLSessionDelegate, URLSessionDownlo
                                     responseStatusCode: response.statusCode,
                                     mimeType: mimeType,
                                     charSet: charSet)
-                if finalStatus != TaskStatus.failed || task.retriesRemaining == 0 {
+                if finalStatus != TaskStatus.failed || task.retriesRemaining == 0 || isStorageFailure(taskException) {
                     // update notification only if not failed, or no retries remaining
                     updateNotification(task: task, notificationType: notificationTypeForTaskStatus(status: finalStatus), notificationConfig: notificationConfig)
                 }
@@ -401,15 +435,8 @@ public class UrlSessionDelegate : NSObject, URLSessionDelegate, URLSessionDownlo
                 }
                 
                 do {
-                    if !FileManager.default.fileExists(atPath: directoryUri.path) {
-                        try FileManager.default.createDirectory(at: directoryUri, withIntermediateDirectories: true)
-                    }
-                    
-                    if FileManager.default.fileExists(atPath: fileUrl.path) {
-                        try FileManager.default.removeItem(at: fileUrl)
-                    }
-                    
-                    try FileManager.default.moveItem(at: location, to: fileUrl)
+                    try checkDownloadStorage(at: location)
+                    try transferDownloadFile(from: location, to: fileUrl, move: true, replace: true)
                     
                     do {
                         if UserDefaults.standard.bool(forKey: BDPlugin.keyConfigExcludeFromCloudBackup)
@@ -424,7 +451,8 @@ public class UrlSessionDelegate : NSObject, URLSessionDelegate, URLSessionDownlo
                     
                 } catch {
                     os_log("File operation failed: %@", log: log, type: .error, error.localizedDescription)
-                    taskException = TaskException(type: .fileSystem, httpResponseCode: -1, description: "File operation failed: \(error.localizedDescription)")
+                    taskException = storageException(error)
+                    try? FileManager.default.removeItem(at: location)
                     return
                 }
             } else {
@@ -435,6 +463,7 @@ public class UrlSessionDelegate : NSObject, URLSessionDelegate, URLSessionDownlo
             }
         } catch {
             os_log("Uncaught file download error for taskId %@ and file %@: %@", log: log, type: .error, task.taskId, task.filename, error.localizedDescription)
+            try? FileManager.default.removeItem(at: location)
         }
     }
     

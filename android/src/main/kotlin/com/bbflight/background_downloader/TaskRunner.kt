@@ -725,7 +725,13 @@ open class TaskRunner(
                                 break
                             }
                             if (numBytes > 0) {
-                                outputStream.write(dataBuffer, 0, numBytes)
+                                try {
+                                    outputStream.write(dataBuffer, 0, numBytes)
+                                } catch (e: DownloadStorageException) {
+                                    setTaskException(e)
+                                    doneCompleter.complete(TaskStatus.failed)
+                                    return@launch
+                                }
                                 bytesTotal += numBytes
                                 val remainingBytes =
                                     BDPlugin.remainingBytesToDownload[task.taskId]
@@ -746,6 +752,7 @@ open class TaskRunner(
                             ) {
                                 updateProgressAndNotify(progress, expectedFileSize, task)
                             }
+                            bytesTotal += numBytes
                         }
                         doneCompleter.complete(TaskStatus.complete)
                     } catch (e: Exception) {
@@ -894,7 +901,13 @@ open class TaskRunner(
         if (e is SocketException || e is SocketTimeoutException) {
             exceptionType = ExceptionType.connection
         }
-        taskException = TaskException(exceptionType, description = e.toString())
+        val description = if (e is DownloadStorageException) e.message.orEmpty() else e.toString()
+        if (isDownloadStorageFailure(description)) {
+            task.retriesRemaining = 0
+            taskCanResume = false
+            BDPlugin.localResumeData.remove(task.taskId)
+        }
+        taskException = TaskException(exceptionType, description = description)
     }
 
     /**

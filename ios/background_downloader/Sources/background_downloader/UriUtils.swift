@@ -314,12 +314,7 @@ public class UriUtilsMethodCallHelper: NSObject,
             return
         }
         do {
-            // Ensure destination directory exists
-            let destinationDirectory = destinationUrl.deletingLastPathComponent()
-            if !FileManager.default.fileExists(atPath: destinationDirectory.path) {
-                try FileManager.default.createDirectory(at: destinationDirectory, withIntermediateDirectories: true, attributes: nil)
-            }
-            try FileManager.default.copyItem(at: sourceUrl, to: destinationUrl)
+            try transferDownloadFile(from: sourceUrl, to: destinationUrl, move: false)
             result(destinationUrl.absoluteString)
         } catch {
             result(FlutterError(code: "COPY_FAILED", message: "Failed to copy file: \(error.localizedDescription)", details: nil))
@@ -349,12 +344,7 @@ public class UriUtilsMethodCallHelper: NSObject,
             return
         }
         do {
-            // Ensure destination directory exists
-            let destinationDirectory = destinationUrl.deletingLastPathComponent()
-            if !FileManager.default.fileExists(atPath: destinationDirectory.path) {
-                try FileManager.default.createDirectory(at: destinationDirectory, withIntermediateDirectories: true, attributes: nil)
-            }
-            try FileManager.default.moveItem(at: sourceUrl, to: destinationUrl)
+            try transferDownloadFile(from: sourceUrl, to: destinationUrl, move: true)
             result(destinationUrl.absoluteString)
         } catch {
             result(FlutterError(code: "MOVE_FAILED", message: "Failed to move file: \(error.localizedDescription)", details: nil))
@@ -595,13 +585,8 @@ public class UriUtilsMethodCallHelper: NSObject,
         let destinationURL = storageDirectory.appendingPathComponent(uniqueFilename)
         
         do {
-            // If a file with the same name already exists, remove it. This should not normally happen because of the UUID, but it's good practice.
-            if fileManager.fileExists(atPath: destinationURL.path) {
-                try fileManager.removeItem(at: destinationURL)
-            }
-            
             // Copy the file from source to destination, and return the media URI to this location
-            try fileManager.copyItem(at: url, to: destinationURL)
+            try transferDownloadFile(from: url, to: destinationURL, move: false)
             return URL(string: "media://support/\(destinationURL.lastPathComponent)")
         } catch {
             completeFlutterResult(FlutterError(code: "PICK_FAILED", message: "Error copying file: \(error)", details: nil))

@@ -5,7 +5,8 @@ import android.content.Context
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
-import android.os.StatFs
+import android.system.Os
+import android.system.OsConstants
 import android.util.Log
 import androidx.core.content.FileProvider.getUriForFile
 import androidx.preference.PreferenceManager
@@ -13,6 +14,7 @@ import com.bbflight.background_downloader.TaskRunner.Companion.TAG
 import io.flutter.plugin.common.MethodChannel
 import kotlinx.coroutines.CompletableDeferred
 import java.io.File
+import java.io.FileOutputStream
 import javax.net.ssl.HttpsURLConnection
 import javax.net.ssl.SSLContext
 import javax.net.ssl.TrustManager
@@ -66,37 +68,34 @@ fun acceptUntrustedCertificates() {
     }
 }
 
-/**
- * Returns true if there is insufficient space to store a file of length
- * [contentLength]
- *
- * Returns false if [contentLength] <= 0
- * Returns false if configCheckAvailableSpace has not been set, or if available
- * space is greater than that setting
- * Returns true otherwise
- */
-fun insufficientSpace(applicationContext: Context, contentLength: Long, targetFile: File? = null): Boolean {
-    if (contentLength <= 0) {
-        return false
+/** Query the filesystem actually backing this descriptor, never the app data volume. */
+internal fun guardedDownloadOutput(
+    applicationContext: Context,
+    output: FileOutputStream,
+    contentLength: Long,
+    removeIncomplete: () -> Unit
+): DownloadStorageGuard = DownloadStorageGuard(
+    output,
+    PreferenceManager.getDefaultSharedPreferences(applicationContext)
+        .getInt(BDPlugin.keyConfigCheckAvailableSpace, 0),
+    contentLength,
+    {
+        // SAF providers may return pipes or proxies, which do not identify storage.
+        require(OsConstants.S_ISREG(Os.fstat(output.fd).st_mode))
+        val stat = Os.fstatvfs(output.fd)
+        DownloadVolumeCapacity(
+            Math.multiplyExact(stat.f_bavail, stat.f_frsize),
+            Math.multiplyExact(stat.f_blocks, stat.f_frsize)
+        )
+    },
+    removeIncomplete,
+    { error ->
+        generateSequence<Throwable>(error) { it.cause }.any {
+            it is android.system.ErrnoException &&
+                (it.errno == OsConstants.ENOSPC || it.errno == OsConstants.EDQUOT)
+        }
     }
-    val checkValue = PreferenceManager.getDefaultSharedPreferences(applicationContext)
-        .getInt(BDPlugin.keyConfigCheckAvailableSpace, 0)
-    if (checkValue <= 0) {
-        return false
-    }
-    val path = targetFile?.parentFile ?: Environment.getDataDirectory()
-    val stat = try {
-        StatFs(path.path)
-    } catch (e: IllegalArgumentException) {
-        // path may not exist (e.g. mkdirs failed); let the actual file operation
-        // surface the real error instead of misreporting insufficient space
-        Log.i(BDPlugin.TAG, "Could not check available space at ${path.path}: ${e.message}")
-        return false
-    }
-    val available = stat.blockSizeLong * stat.availableBlocksLong
-    return available - (BDPlugin.remainingBytesToDownload.values.sum()
-            + contentLength) < (checkValue.toLong() shl 20)
-}
+)
 
 /**
  * 8-char lowercase hex FNV-1a 32-bit hash of [taskId]

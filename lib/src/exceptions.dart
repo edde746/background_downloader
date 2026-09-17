@@ -9,6 +9,16 @@ const _exceptions = {
   'TaskHttpException': TaskHttpException.new,
 };
 
+/// Storage refusals need fresh user action, not an automatic transfer retry.
+bool isDownloadStorageFailure(TaskException? exception) {
+  if (exception is! TaskFileSystemException) return false;
+  final description = exception.description.toLowerCase();
+  return description.contains('insufficient space to store') ||
+      description.contains('download storage capacity could not be determined') ||
+      description.contains('no space left on device') ||
+      description.contains('enospc');
+}
+
 /// Contains Exception information associated with a failed [Task]
 ///
 /// The [exceptionType] categorizes and describes the exception

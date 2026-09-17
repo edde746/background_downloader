@@ -18,6 +18,7 @@ import 'desktop_downloader.dart';
 import 'download_isolate.dart';
 import 'parallel_download_isolate.dart';
 import 'upload_isolate.dart';
+import 'storage_space.dart';
 
 /// global variables, unique to this isolate
 var bytesTotal = 0; // total bytes read in this download session
@@ -66,6 +67,7 @@ Future<void> doTask((RootIsolateToken, SendPort) isolateArguments) async {
     List<MTLSConfig> mtlsConfigs,
     String? tempFilePathConfig,
     bool initiallyCanceled,
+    int checkAvailableSpace,
   ) = await messagesToIsolate.next;
   DesktopDownloader.setHttpClient(
     requestTimeout,
@@ -73,6 +75,7 @@ Future<void> doTask((RootIsolateToken, SendPort) isolateArguments) async {
     bypassTLSCertificateValidation,
     mtlsConfigs,
   );
+  DesktopDownloader.checkAvailableSpace = checkAvailableSpace;
   Logger.root.level = Level.ALL;
   Logger.root.onRecord.listen((LogRecord rec) {
     if (kDebugMode) {
@@ -206,14 +209,14 @@ Future<TaskStatus> transferBytes(
   Task task,
   SendPort sendPort, [
   Duration requestTimeout = const Duration(seconds: 60),
+  StorageSpaceGuard? storageGuard,
 ]) async {
   if (contentLength == 0) {
     contentLength = -1;
   }
   var resultStatus = TaskStatus.complete;
   try {
-    await outStream.addStream(
-      inStream
+    final stream = inStream
           .timeout(
             requestTimeout,
             onTimeout: (sink) {
@@ -250,8 +253,14 @@ Future<TaskStatus> transferBytes(
               );
             }
             return bytes;
-          }),
-    );
+          });
+    if (storageGuard == null) {
+      await outStream.addStream(stream);
+    } else {
+      await for (final bytes in stream) {
+        await storageGuard.write(outStream as IOSink, bytes);
+      }
+    }
   } catch (e) {
     if (resultStatus == TaskStatus.complete) {
       // this was an unintentional error thrown within the stream processing

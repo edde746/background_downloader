@@ -67,8 +67,14 @@ private func moveToPhotoLibrary(filePath: String, destination: SharedStorage) as
 #if BYPASS_PERMISSION_IOSADDTOPHOTOLIBRARY
     return nil
 #else
-    guard let fileURL = URL(string: filePath) else {
-        os_log("filePath invalid: %@", log: log, type: .info, filePath)
+    let fileURL = URL(fileURLWithPath: filePath)
+    do {
+        // PhotoKit owns the actual destination and asynchronous write. It does
+        // not expose a volume URL or progress callback: only preflight is possible.
+        let size = try FileManager.default.attributesOfItem(atPath: filePath)[.size] as? NSNumber
+        try checkDownloadStorage(at: FileManager.default.temporaryDirectory, remainingBytes: size?.int64Value ?? 0)
+    } catch {
+        os_log("Cannot move to Photos Library: %@", log: log, type: .error, error.localizedDescription)
         return nil
     }
     let result = await withCheckedContinuation { continuation in
@@ -187,11 +193,8 @@ private func moveToFakeSharedStorage(filePath: String, destination: SharedStorag
         }
     }
     let destUrl = directory.appendingPath((filePath as NSString).lastPathComponent)
-    if FileManager.default.fileExists(atPath: destUrl.path) {
-        try? FileManager.default.removeItem(at: destUrl)
-    }
     do {
-        try FileManager.default.moveItem(at: fileUrl as URL, to: destUrl)
+        try transferDownloadFile(from: fileUrl as URL, to: destUrl, move: true, replace: true)
     } catch {
         os_log("Failed to move file %@ to %@: %@", log: log, type: .error, filePath, destUrl.path, error.localizedDescription)
         return nil

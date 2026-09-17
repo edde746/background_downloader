@@ -12,6 +12,7 @@ import '../task.dart';
 import '../utils.dart';
 import 'desktop_downloader.dart';
 import 'isolate.dart';
+import 'storage_space.dart';
 
 var taskRangeStartByte = 0; // Start of the Task's download range
 String? eTagHeader;
@@ -69,6 +70,10 @@ Future<void> doDownloadTask(
   }
   var resultStatus = TaskStatus.failed;
   try {
+    StorageSpaceGuard(
+      tempFilePath,
+      DesktopDownloader.checkAvailableSpace,
+    ).check();
     final response = await client.send(request).timeout(requestTimeout);
     if (!isCanceled) {
       eTagHeader = response.headers['etag'] ?? response.headers['ETag'];
@@ -133,6 +138,7 @@ Future<void> doDownloadTask(
   } catch (e) {
     logError(downloadTask, e.toString());
     setTaskError(e);
+    if (isDownloadStorageFailure(taskException)) deleteTempFile(tempFilePath);
   }
   if (isCanceled) {
     // cancellation overrides other results
@@ -211,6 +217,13 @@ Future<TaskStatus> processOkDownloadResponse(
         rethrow;
       }
     }
+    outStream.done.ignore();
+    // Guard the filesystem the stream actually writes to (post-fallback)
+    final guard = StorageSpaceGuard(
+      actualTempFilePath,
+      DesktopDownloader.checkAvailableSpace,
+    );
+    guard.check(contentLength);
     final transferBytesResult = await transferBytes(
       response.stream,
       outStream,
@@ -218,6 +231,7 @@ Future<TaskStatus> processOkDownloadResponse(
       downloadTask,
       sendPort,
       requestTimeout,
+      DesktopDownloader.checkAvailableSpace == 0 ? null : guard,
     );
     switch (transferBytesResult) {
       case .complete:
@@ -227,11 +241,11 @@ Future<TaskStatus> processOkDownloadResponse(
         outStream = null;
         final dirPath = p.dirname(filePath);
         Directory(dirPath).createSync(recursive: true);
-        moveTempFileToDestination(actualTempFilePath, filePath);
+        await moveTempFileToDestination(actualTempFilePath, filePath, downloadTask.taskId);
         resultStatus = TaskStatus.complete;
 
       case .canceled:
-        deleteTempFile(actualTempFilePath);
+        // Close the writer before cleanup (required on Windows).
         resultStatus = TaskStatus.canceled;
 
       case .paused:
@@ -265,6 +279,7 @@ Future<TaskStatus> processOkDownloadResponse(
         await outStream?.close();
       } catch (_) {}
       if (resultStatus == TaskStatus.failed &&
+          !isDownloadStorageFailure(taskException) &&
           serverAcceptsRanges &&
           (bytesTotal + startByte > 1 << 20 || isResume)) {
         // send ResumeData to allow resume after fail
@@ -343,18 +358,35 @@ Future<bool> prepareResume(
 }
 
 /// Move the temporary file to the final destination.
-void moveTempFileToDestination(String tempFilePath, String filePath) {
-  final destination = File(filePath);
-  if (destination.existsSync()) {
-    destination.deleteSync();
-  }
+Future<void> moveTempFileToDestination(
+  String tempFilePath,
+  String filePath,
+  String taskId,
+) async {
+  final source = File(tempFilePath);
   try {
-    File(tempFilePath).renameSync(filePath);
-  } on FileSystemException {
-    // cross-device move (e.g. Config.tempFilePath on another volume)
-    File(tempFilePath).copySync(filePath);
-    File(tempFilePath).deleteSync();
+    // Native rename replaces atomically, preserving the old destination when
+    // publication fails; never delete a completed destination first.
+    await source.rename(filePath);
+  } on FileSystemException catch (error) {
+    final code = error.osError?.errorCode;
+    if (code != 18 && !(Platform.isWindows && code == 17)) rethrow;
+    // A legacy resume file can live on another volume. Stage the copy beside
+    // its destination and guard that volume, not the source volume.
+    final staging = File(partialDownloadFilePath(filePath, taskId));
+    try {
+      await copyWithSpaceGuard(
+        source,
+        staging,
+        DesktopDownloader.checkAvailableSpace,
+      );
+      await staging.rename(filePath);
+      await source.delete();
+    } finally {
+      if (await staging.exists()) await staging.delete();
+    }
   }
+
 }
 
 /// Delete the temporary file

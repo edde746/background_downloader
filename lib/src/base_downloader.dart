@@ -1070,6 +1070,7 @@ abstract base class BaseDownloader {
         !isConnected;
 
     if (update.status == TaskStatus.failed &&
+        !isDownloadStorageFailure(update.exception) &&
         (task.retriesRemaining > 0 || (!isConnected && isConnectionError))) {
       _emitStatusUpdate(TaskStatusUpdate(task, TaskStatus.waitingToRetry));
       _emitProgressUpdate(TaskProgressUpdate(task, progressWaitingToRetry));

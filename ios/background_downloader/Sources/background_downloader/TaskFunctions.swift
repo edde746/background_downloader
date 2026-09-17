@@ -431,6 +431,8 @@ func updateProgress(task: Task, totalBytesExpected: Int64, totalBytesDone: Int64
 /// Sends status update via the background channel to Dart. Dart decides which
 /// updates are user-visible and synthesizes terminal progress.
 func processStatusUpdate(task: Task, status: TaskStatus, taskException: TaskException? = nil, responseBody: String? = nil, responseHeaders: [AnyHashable:Any]? = nil, responseStatusCode: Int? = nil, mimeType: String? = nil, charSet: String? = nil) {
+    let storageFailure = status == .failed && isStorageFailure(taskException)
+    let task = storageFailure ? task.copyWith(retriesRemaining: 0) : task
     // Intercept status updates resulting from re-enqueue requests, which
     // themselves are triggered by a change in WiFi requirement
     let intercepted = BDPlugin.propertyLock.withLock {
@@ -440,7 +442,7 @@ func processStatusUpdate(task: Task, status: TaskStatus, taskException: TaskExce
                     WiFiQueue.shared.reEnqueue(nil) // signal end of batch
                 }
             }
-            if [TaskStatus.paused, TaskStatus.canceled, TaskStatus.failed].contains(status) {
+            if !storageFailure && [TaskStatus.paused, TaskStatus.canceled, TaskStatus.failed].contains(status) {
                 let reEnqueueData = EnqueueItem(task: task, notificationConfigJsonString: BDPlugin.notificationConfigJsonStrings[task.taskId], resumeDataAsBase64String: BDPlugin.localResumeData[task.taskId] ?? "")
                 WiFiQueue.shared.reEnqueue(reEnqueueData)
                 return true // intercepted
@@ -491,7 +493,6 @@ func processStatusUpdate(task: Task, status: TaskStatus, taskException: TaskExce
         BDPlugin.propertyLock.withLock {
             BDPlugin.progressInfo.removeValue(forKey: task.taskId)
             BDPlugin.localResumeData.removeValue(forKey: task.taskId)
-            BDPlugin.remainingBytesToDownload.removeValue(forKey: task.taskId)
             BDPlugin.tasksWithModifications.removeValue(forKey: task.taskId)
             BDPlugin.tasksWithContentLengthOverride.removeValue(forKey: task.taskId)
             BDPlugin.responseBodyData.removeValue(forKey: task.taskId)
@@ -746,35 +747,6 @@ func taskRequiresWiFi(task: Task) -> Bool {
     return BDPlugin.requireWiFi == .forAllTasks || (BDPlugin.requireWiFi == .asSetByTask && task.requiresWiFi)
 }
 
-/**
- * Returns true if there is insufficient space to store a file of length
- * [contentLength]
- *
- * Returns false if [contentLength] <= 0
- * Returns false if configCheckAvailableSpace has not been set, or if available
- * space is greater than that setting
- * Returns true otherwise
- */
-func insufficientSpace(contentLength: Int64) -> Bool {
-    guard contentLength > 0 else {
-        return false
-    }
-    let checkValue = UserDefaults.standard.integer(forKey: BDPlugin.keyConfigCheckAvailableSpace)
-    guard
-        // Check if the configCheckAvailableSpace preference is set and is positive
-        checkValue > 0,
-        let path = NSSearchPathForDirectoriesInDomains(.documentDirectory, .userDomainMask, true).first,
-        let available = try? URL(fileURLWithPath: path).resourceValues(forKeys: [URLResourceKey.volumeAvailableCapacityForImportantUsageKey]).volumeAvailableCapacityForImportantUsage
-    else {
-        return false
-    }
-    // Calculate the total remaining bytes to download
-    let remainingBytesToDownload = BDPlugin.propertyLock.withLock( {
-        BDPlugin.remainingBytesToDownload.values.reduce(0, +)
-    })
-    // Return true if there is insufficient space to store the file
-    return available - (remainingBytesToDownload + contentLength) < checkValue << 20
-}
 
 /// Post result [value] on FlutterResult completer
 func postResult(result: FlutterResult?, value: Any) {

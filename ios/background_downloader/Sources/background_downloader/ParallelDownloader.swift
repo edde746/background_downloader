@@ -198,7 +198,7 @@ public class ParallelDownloader: NSObject {
         // Confirm chunk is part of this parent task
         guard let chunk = chunks.first(where: { $0.task.taskId == chunkTaskId }) else { return }
         // first check for fail -> retry
-        if status == .failed && chunk.task.retriesRemaining > 0 {
+        if status == .failed && chunk.task.retriesRemaining > 0 && !isStorageFailure(taskException) {
             chunk.task.retriesRemaining -= 1
             let waitTimeSeconds = 2 << min(chunk.task.retries - chunk.task.retriesRemaining - 1, 8)
             os_log("Chunk with taskId %@ failed, waiting %d seconds to retry; %d retries remaining", log: log, type: .info, chunk.task.taskId, waitTimeSeconds, chunk.task.retriesRemaining)
@@ -309,42 +309,39 @@ public class ParallelDownloader: NSObject {
     
     /// Stitch all chunks together into one file, per the [parentTask]
     private func stitchChunks() -> TaskStatus {
+        let fileManager = FileManager.default
+        let inputFiles = chunks.sorted(by: { $0.fromByte < $1.fromByte }).compactMap {
+            getFilePath(for: $0.task).map { URL(fileURLWithPath: $0) }
+        }
+        defer {
+            for file in inputFiles { try? fileManager.removeItem(at: file) }
+        }
         do {
-            let fileManager = FileManager.default
-            let outputFilePath = getFilePath(for: parentTask)!
-            let outputFile = URL(fileURLWithPath: outputFilePath)
-            if fileManager.fileExists(atPath: outputFilePath) {
-                try? fileManager.removeItem(at: outputFile)
+            guard inputFiles.count == chunks.count, let path = getFilePath(for: parentTask) else {
+                throw CocoaError(.fileReadNoSuchFile)
             }
-            fileManager.createFile(atPath: outputFilePath, contents: nil)
-            let outputFileHandle = try FileHandle(forWritingTo: outputFile)
-            defer {
-                outputFileHandle.closeFile()
-                for chunk in chunks {
-                    let inputFilePath = getFilePath(for: chunk.task)!
-                    let inputFileURL = URL(fileURLWithPath: inputFilePath)
-                    if fileManager.fileExists(atPath: inputFilePath) {
-                        try? FileManager.default.removeItem(at: inputFileURL)
-                    }
-                }
+            let outputFile = URL(fileURLWithPath: path)
+            let directory = outputFile.deletingLastPathComponent()
+            let accessed = directory.startAccessingSecurityScopedResource()
+            defer { if accessed { directory.stopAccessingSecurityScopedResource() } }
+            var remaining = parallelDownloadContentLength
+            try checkDownloadStorage(at: directory, remainingBytes: remaining)
+            try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+            let staging = directory.appendingPathComponent(".background_downloader-\(UUID().uuidString).partial")
+            defer { try? fileManager.removeItem(at: staging) }
+            guard fileManager.createFile(atPath: staging.path, contents: nil) else { throw CocoaError(.fileWriteUnknown) }
+            let output = try FileHandle(forWritingTo: staging)
+            defer { try? output.close() }
+            for input in inputFiles {
+                try copyDownloadBytes(from: input, to: output, at: staging, remaining: &remaining)
             }
-            for chunk in chunks.sorted(by: { $0.fromByte < $1.fromByte }) {
-                let filePath = getFilePath(for: chunk.task)!
-                let fileHandle = try FileHandle(forReadingFrom: URL(fileURLWithPath: filePath))
-                defer {
-                    fileHandle.closeFile()
-                }
-                while true {
-                    let data = fileHandle.readData(ofLength: 2 << 13)
-                    if data.isEmpty {
-                        break
-                    }
-                    outputFileHandle.write(data)
-                }
-            }
+            try output.synchronize()
+            try output.close()
+            try checkDownloadStorage(at: staging)
+            try commitDownloadFile(staging, to: outputFile, replace: true)
         } catch {
             os_log("Error stitching chunks: %@", log: log, type: .info, error.localizedDescription)
-            taskException = TaskException(type: .fileSystem, description: "Error stitching chunks: \(error.localizedDescription)")
+            taskException = storageException(error)
             return .failed
         }
         return .complete

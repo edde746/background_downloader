@@ -9,11 +9,13 @@ import 'package:collection/collection.dart';
 import '../chunk.dart';
 import '../exceptions.dart';
 import '../models.dart';
+import '../resume_data_cleanup.dart';
 import '../task.dart';
 import '../utils.dart';
 import 'desktop_downloader.dart';
 import 'download_isolate.dart';
 import 'isolate.dart';
+import 'storage_space.dart';
 
 /// A [ParallelDownloadTask] pings the server to get the content-length of the
 /// download, then creates a list of [Chunk]s, each representing a portion
@@ -64,6 +66,11 @@ Future<void> doParallelDownloadTask(
   SendPort sendPort,
 ) async {
   parentTask = task;
+  try {
+    StorageSpaceGuard(
+      await task.filePath(),
+      DesktopDownloader.checkAvailableSpace,
+    ).check();
   if (!isResume) {
     // start the download by creating [Chunk]s and enqueuing chunk tasks
     final response = await DesktopDownloader.httpClientForUrl(task.url)
@@ -86,7 +93,11 @@ Future<void> doParallelDownloadTask(
       }
       extractContentType(response.headers);
       chunks = createChunks(task, response.headers);
-      for (final chunk in chunks) {
+      StorageSpaceGuard(
+        await task.filePath(),
+        DesktopDownloader.checkAvailableSpace,
+      ).check(parallelDownloadContentLength);
+      for (var chunk in chunks) {
         // Ask main isolate to enqueue the child task. Updates related to the child
         // will be sent to this isolate (the child's metaData contains the parent taskId).
         sendPort.send(('enqueueChild', chunk.task));
@@ -125,6 +136,12 @@ Future<void> doParallelDownloadTask(
     final statusUpdate = await parallelTaskStatusUpdateCompleter.future;
     processStatusUpdateInIsolate(task, statusUpdate.status, sendPort);
   }
+  } catch (error) {
+    setTaskError(error);
+    cancelAllChunkTasks(sendPort);
+    await deleteCompletedChunks();
+    processStatusUpdateInIsolate(task, TaskStatus.failed, sendPort);
+  }
 }
 
 /// Process incoming [update] for a chunk, within the [ParallelDownloadTask]
@@ -135,8 +152,16 @@ Future<void> chunkStatusUpdate(
   SendPort sendPort,
 ) async {
   final chunkTask = update.task;
+  if (parallelTaskStatusUpdateCompleter.isCompleted) {
+    if (update.status == TaskStatus.complete && !isPaused) {
+      deleteTempFile(await chunkTask.filePath());
+    }
+    return;
+  }
   // first check for fail -> retry
-  if (update.status == TaskStatus.failed && chunkTask.retriesRemaining > 0) {
+  if (update.status == TaskStatus.failed &&
+      chunkTask.retriesRemaining > 0 &&
+      !isDownloadStorageFailure(update.exception)) {
     chunkTask.decreaseRetriesRemaining();
     final waitTime = Duration(
       seconds: 2 << min(chunkTask.retries - chunkTask.retriesRemaining - 1, 8),
@@ -148,7 +173,9 @@ Future<void> chunkStatusUpdate(
     );
     Future.delayed(waitTime, () async {
       // after delay, resume or enqueue task again if it's still waiting
-      sendPort.send(('enqueueChild', chunkTask));
+      if (!parallelTaskStatusUpdateCompleter.isCompleted) {
+        sendPort.send(('enqueueChild', chunkTask));
+      }
     });
   } else {
     // no retry
@@ -156,11 +183,12 @@ Future<void> chunkStatusUpdate(
     switch (newStatusUpdate) {
       case TaskStatus.complete:
         final result = await stitchChunks();
+        if (parallelTaskStatusUpdateCompleter.isCompleted) return;
         parallelTaskStatusUpdateCompleter.complete(
           TaskStatusUpdate(
             task,
             result,
-            null,
+            taskException,
             responseBody,
             responseHeaders,
             responseStatusCode,
@@ -171,6 +199,9 @@ Future<void> chunkStatusUpdate(
         taskException = update.exception;
         responseBody = update.responseBody;
         cancelAllChunkTasks(sendPort);
+        if (isDownloadStorageFailure(taskException)) {
+          await deleteCompletedChunks();
+        }
         parallelTaskStatusUpdateCompleter.complete(
           TaskStatusUpdate(
             task,
@@ -309,6 +340,7 @@ double parentTaskProgress() {
 
 /// Cancel this [ParallelDownloadTask]
 void cancelParallelDownloadTask(ParallelDownloadTask task, SendPort sendPort) {
+  if (parallelTaskStatusUpdateCompleter.isCompleted) return;
   cancelAllChunkTasks(sendPort);
   parallelTaskStatusUpdateCompleter.complete(
     TaskStatusUpdate(task, TaskStatus.canceled),
@@ -336,6 +368,7 @@ void cancelAllChunkTasks(SendPort sendPort) {
 /// the resumed [ParallelDownloadTask], then resume each of the
 /// [DownloadTask]s. This is done in [DesktopDownloader.resume]
 void pauseParallelDownloadTask(ParallelDownloadTask task, SendPort sendPort) {
+  if (parallelTaskStatusUpdateCompleter.isCompleted) return;
   pauseAllChunkTasks(sendPort);
   sendPort.send(('resumeData', jsonEncode(chunks), -1, null));
   parallelTaskStatusUpdateCompleter.complete(
@@ -353,57 +386,52 @@ void pauseAllChunkTasks(SendPort sendPort) {
 
 /// Stitch all chunks together into one file, per the [parentTask]
 Future<TaskStatus> stitchChunks() async {
+  final destination = await parentTask.filePath();
+  final staging = File(partialDownloadFilePath(destination, parentTask.taskId));
+  final guard = StorageSpaceGuard(
+    staging.path,
+    DesktopDownloader.checkAvailableSpace,
+  );
   IOSink? outStream;
-  StreamSubscription? subscription;
+  var complete = false;
   try {
-    final outFile = File(await parentTask.filePath());
-    if (await outFile.exists()) {
-      await outFile.delete();
-    }
-    outStream = outFile.openWrite();
+    guard.check(parallelDownloadContentLength);
+    await staging.parent.create(recursive: true);
+    outStream = staging.openWrite();
+    outStream.done.ignore();
     for (final chunk in chunks.sorted((a, b) => a.fromByte - b.fromByte)) {
       final inFile = File(await chunk.task.filePath());
-      if (!await inFile.exists()) {
-        throw const FileSystemException('Missing chunk file');
+      await for (final bytes in inFile.openRead()) {
+        if (isCanceled || isPaused) {
+          return isCanceled ? TaskStatus.canceled : TaskStatus.paused;
+        }
+        await guard.write(outStream, bytes);
       }
-      final inStream = inFile.openRead();
-      final doneCompleter = Completer<bool>();
-      subscription = inStream.listen(
-        (bytes) {
-          outStream?.add(bytes);
-        },
-        onDone: () => doneCompleter.complete(true),
-        onError: (error) {
-          logError(parentTask, e.toString());
-          setTaskError(error);
-          doneCompleter.complete(false);
-        },
-      );
-      final success = await doneCompleter.future;
-      if (!success) {
-        return TaskStatus.failed;
-      }
-      subscription.cancel();
-      await inFile.delete();
     }
-    await outStream.flush();
-  } catch (e) {
-    logError(parentTask, e.toString());
-    setTaskError(e);
+    await outStream.close();
+    outStream = null;
+    await moveTempFileToDestination(staging.path, destination, parentTask.taskId);
+    complete = true;
+    return TaskStatus.complete;
+  } catch (error) {
+    logError(parentTask, error.toString());
+    setTaskError(error);
     return TaskStatus.failed;
   } finally {
-    await outStream?.close();
-    subscription?.cancel();
-    for (final chunk in chunks) {
-      try {
-        final file = File(await chunk.task.filePath());
-        await file.delete();
-      } on FileSystemException {
-        // ignore
-      }
+    try {
+      await outStream?.close();
+    } catch (_) {}
+    if (!complete) deleteTempFile(staging.path);
+    if (!isPaused) await deleteCompletedChunks();
+  }
+}
+
+Future<void> deleteCompletedChunks() async {
+  for (final chunk in chunks) {
+    if (chunk.status == TaskStatus.complete) {
+      deleteTempFile(await chunk.task.filePath());
     }
   }
-  return TaskStatus.complete;
 }
 
 /// Returns a list of chunk information for this task, and sets
