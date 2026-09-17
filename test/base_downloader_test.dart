@@ -3,6 +3,7 @@ import 'dart:io';
 
 import 'package:background_downloader/background_downloader.dart';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'mock_persistent_storage.dart';
@@ -11,6 +12,11 @@ import 'mock_persistent_storage.dart';
 /// with in-memory storage. No test performs an actual download.
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
+  TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+      .setMockMethodCallHandler(
+    const MethodChannel('dev.fluttercommunity.plus/connectivity'),
+    (MethodCall call) async => ['wifi'],
+  );
   debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
   final storage = MockPersistentStorage();
   final downloader = FileDownloader(

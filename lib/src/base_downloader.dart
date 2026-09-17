@@ -301,7 +301,7 @@ abstract base class BaseDownloader {
       final statusUpdateMap = await popUndeliveredData(
         Undelivered.statusUpdates,
       );
-      for (var jsonString in statusUpdateMap.values) {
+      for (final jsonString in statusUpdateMap.values) {
         processStatusUpdate(TaskStatusUpdate.fromJsonString(jsonString));
       }
       retrievedLocallyStoredData = true;
@@ -845,7 +845,7 @@ abstract base class BaseDownloader {
   /// Remove resumeData and delete its associated temp file(s).
   Future<void> discardResumeData([String? taskId]) async {
     final resumeData = <ResumeData>[];
-    final taskIds = <String>{if (taskId != null) taskId};
+    final taskIds = <String>{?taskId};
     if (taskId == null) {
       resumeData.addAll(await _storage.retrieveAllResumeData());
     } else {

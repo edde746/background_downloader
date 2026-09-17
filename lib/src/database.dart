@@ -168,13 +168,11 @@ interface class Database {
     await Future.wait(resumeTaskIds.map(_storage.removeResumeData));
   }
 
-  Future<void> _deleteResumeDataTempFiles(ResumeData resumeData) {
-    return deleteResumeDataTempFiles(
+  Future<void> _deleteResumeDataTempFiles(ResumeData resumeData) => deleteResumeDataTempFiles(
       resumeData,
       getResumeData: _storage.retrieveResumeData,
       log: _log,
     );
-  }
 
   int _updateCount = 0;
   bool _autoClean = false;

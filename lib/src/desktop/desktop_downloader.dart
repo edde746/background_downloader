@@ -614,7 +614,7 @@ final class DesktopDownloader extends BaseDownloader {
       case (Config.checkAvailableSpace, Config.never):
         checkAvailableSpace = 0;
 
-      case (Config.checkAvailableSpace, int value) when value >= -1:
+      case (Config.checkAvailableSpace, final int value) when value >= -1:
         checkAvailableSpace = value;
 
       case (Config.requestTimeout, final Duration? duration):

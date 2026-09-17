@@ -296,7 +296,7 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
                     requestBuilder.setExpedited(policy = OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
                 }
                 val workManager = WorkManager.getInstance(context)
-                val uniquePolicy = uniqueWorkPolicy(task, resumeData, initialDelayMillis)
+                val uniquePolicy = uniqueWorkPolicy(task, resumeData, actualDelayMillis)
                 success = try {
                     val operation = try {
                         workManager.enqueueUniqueWork(

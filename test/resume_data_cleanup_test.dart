@@ -189,12 +189,10 @@ void main() {
   });
 }
 
-DownloadTask _taskForFile(String taskId, File file) {
-  return DownloadTask(
+DownloadTask _taskForFile(String taskId, File file) => DownloadTask(
     taskId: taskId,
     url: 'https://example.com/${file.uri.pathSegments.last}',
     filename: file.uri.pathSegments.last,
     directory: file.parent.path,
     baseDirectory: BaseDirectory.root,
   );
-}

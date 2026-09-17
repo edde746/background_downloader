@@ -209,10 +209,8 @@ void main() {
 
       db.cleanUp(maxRecordCount: 2, maxAge: null, autoClean: false);
 
-      await _waitUntil(() async {
-        return await storage.retrieveTaskRecord(failedTask.taskId) == null &&
-            await storage.retrieveTaskRecord(completeTask.taskId) == null;
-      });
+      await _waitUntil(() async => await storage.retrieveTaskRecord(failedTask.taskId) == null &&
+            await storage.retrieveTaskRecord(completeTask.taskId) == null);
       expect(await storage.retrieveTaskRecord(runningTask.taskId), isNotNull);
       expect(await storage.retrieveTaskRecord(enqueuedTask.taskId), isNotNull);
       expect(await storage.retrieveTaskRecord(waitingTask.taskId), isNotNull);

@@ -15,14 +15,10 @@ class MockPersistentStorage implements PersistentStorage {
   }
 
   @override
-  Future<TaskRecord?> retrieveTaskRecord(String taskId) {
-    return Future.value(_taskRecords[taskId]);
-  }
+  Future<TaskRecord?> retrieveTaskRecord(String taskId) => Future.value(_taskRecords[taskId]);
 
   @override
-  Future<List<TaskRecord>> retrieveAllTaskRecords() {
-    return Future.value(_taskRecords.values.toList());
-  }
+  Future<List<TaskRecord>> retrieveAllTaskRecords() => Future.value(_taskRecords.values.toList());
 
   @override
   Future<void> removeTaskRecord(String? taskId) async {
@@ -58,24 +54,16 @@ class MockPersistentStorage implements PersistentStorage {
   }
 
   @override
-  Future<List<Task>> retrieveAllPausedTasks() {
-    return Future.value(_pausedTasks.values.toList());
-  }
+  Future<List<Task>> retrieveAllPausedTasks() => Future.value(_pausedTasks.values.toList());
 
   @override
-  Future<List<ResumeData>> retrieveAllResumeData() {
-    return Future.value(_resumeData.values.toList());
-  }
+  Future<List<ResumeData>> retrieveAllResumeData() => Future.value(_resumeData.values.toList());
 
   @override
-  Future<Task?> retrievePausedTask(String taskId) {
-    return Future.value(_pausedTasks[taskId]);
-  }
+  Future<Task?> retrievePausedTask(String taskId) => Future.value(_pausedTasks[taskId]);
 
   @override
-  Future<ResumeData?> retrieveResumeData(String taskId) {
-    return Future.value(_resumeData[taskId]);
-  }
+  Future<ResumeData?> retrieveResumeData(String taskId) => Future.value(_resumeData[taskId]);
 
   @override
   Future<void> storePausedTask(Task task) async {

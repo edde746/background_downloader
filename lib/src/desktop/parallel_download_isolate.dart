@@ -97,7 +97,7 @@ Future<void> doParallelDownloadTask(
         await task.filePath(),
         DesktopDownloader.checkAvailableSpace,
       ).check(parallelDownloadContentLength);
-      for (var chunk in chunks) {
+      for (final chunk in chunks) {
         // Ask main isolate to enqueue the child task. Updates related to the child
         // will be sent to this isolate (the child's metaData contains the parent taskId).
         sendPort.send(('enqueueChild', chunk.task));
