@@ -10,6 +10,7 @@
 * [Desktop] Temp file writes fall back to a hidden file in the target directory when the temp directory is not writable, and a task canceled before its isolate starts exits cleanly instead of leaking
 * [Desktop] Final progress updates are synthesized centrally in `BaseDownloader.processStatusUpdate`, guaranteeing exactly one terminal progress event per final status
 * [Android/iOS] Downloads and parallel downloads stop before device storage is exhausted: free space is checked before starting and monitored during transfer, failing with a storage error instead of filling the disk
+* [Desktop] The same storage protection applies to desktop downloads. A volume that does not report its capacity (some network and FUSE mounts) is not checked, and a write that runs out of space fails as a storage error without a native retry, whatever the OS message language
 * [Linux/Desktop] A host without a documents directory (missing `xdg-user-dirs`) no longer hangs startup: the Localstore migration treats it as nothing to migrate and `BaseDownloader.initialize` settles `ready` even when storage init fails
 * [Android] `Config.tempFilePath` is honored for the `.part` file location when set
 

@@ -12,7 +12,7 @@ The following configurations are supported:
   - `(Config.resourceTimeout, Duration? duration)` sets the iOS resourceTimeout, or if null resets to default. This is the time allowed to complete the download/upload
 * Checking available space
   - `(Config.checkAvailableSpace, int minMegabytes)` ensures a file download fails if less than `minMegabytes` space will be available after this download completes
-  - `(Config.checkAvailableSpace, true)` uses an adaptive floor of `max(256 MiB, 1% of the target volume's capacity)`, and additionally monitors live free space during the transfer (including unknown-length responses, `content://` destinations and parallel-chunk stitching), stopping the download before the volume is exhausted
+  - `(Config.checkAvailableSpace, true)` uses an adaptive floor of `max(256 MiB, 1% of the target volume's capacity)`, and additionally monitors live free space during the transfer (including unknown-length responses, `content://` destinations and parallel-chunk stitching), stopping the download before the volume is exhausted. On desktop, a volume that does not report its capacity (some network and FUSE mounts) is not checked; a download that then runs out of space still fails with a storage error
   - `(Config.checkAvailableSpace, false)` or `(Config.checkAvailableSpace, Config.never)` turns off checking available space
 * Skipping download if destination file already present. Note the skip check is done at the moment the file is enqueued, not when it starts downloading.
   - `(Config.skipExistingFiles, true)` or `(Config.skipExistingFiles, Config.always)` skips download if the file is already present, and returns a `TaskStatusUpdate` with `TaskStatus.complete` and a 304 `responseStatusCode`

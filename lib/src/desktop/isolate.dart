@@ -467,6 +467,9 @@ void setTaskError(dynamic e) {
   taskException = switch (e) {
     HttpException() ||
     TimeoutException() => TaskConnectionException(e.toString()),
+    IOException() when isOutOfSpaceError(e) => TaskFileSystemException(
+      'Insufficient space to store the downloaded file: $e',
+    ),
     IOException() => TaskFileSystemException(e.toString()),
     TaskException() => e,
     _ => TaskException(e.toString()),
