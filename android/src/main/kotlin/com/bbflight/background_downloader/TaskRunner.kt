@@ -752,7 +752,6 @@ open class TaskRunner(
                             ) {
                                 updateProgressAndNotify(progress, expectedFileSize, task)
                             }
-                            bytesTotal += numBytes
                         }
                         doneCompleter.complete(TaskStatus.complete)
                     } catch (e: Exception) {
