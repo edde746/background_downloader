@@ -368,11 +368,24 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
             return (requireWifi == RequireWiFi.forAllTasks || (requireWifi == RequireWiFi.asSetByTask && task.requiresWiFi))
         }
 
-        /** Create a NetworkRequest requiring Wi-Fi and internet capability */
-        private fun wifiNetworkRequest(): NetworkRequest =
+        /**
+         * NetworkRequest for a task that requires Wi-Fi (API 28+): internet over
+         * Wi-Fi or Ethernet.
+         *
+         * JobScheduler matches the request against the app's default network.
+         * [NetworkRequest.Builder] starts with NOT_VPN and NOT_RESTRICTED, so with
+         * a VPN up (always the app's default network) the task would wait forever.
+         * Drop both, as [android.app.job.JobInfo.Builder.setRequiredNetworkType]
+         * does. A VPN carries the transports of its underlying networks, so a VPN
+         * over Wi-Fi or Ethernet matches and a VPN over cellular does not.
+         */
+        internal fun wifiNetworkRequest(): NetworkRequest =
             NetworkRequest.Builder()
                 .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .removeCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+                .removeCapability(NetworkCapabilities.NET_CAPABILITY_NOT_RESTRICTED)
                 .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+                .addTransportType(NetworkCapabilities.TRANSPORT_ETHERNET)
                 .build()
 
         /**

@@ -1076,8 +1076,9 @@ interface class FileDownloader {
   /// Restarts running upload tasks if [alsoRestartUploads] is true (which
   /// requires [rescheduleRunningTasks] to be true as well).
   ///
-  /// Note that on Android (API 28+), requiring WiFi enforces a Wi-Fi network constraint
-  /// (`TRANSPORT_WIFI`), preventing tasks from running over cellular connections even if unmetered.
+  /// Note that on Android (API 28+), requiring WiFi enforces a Wi-Fi or Ethernet network
+  /// constraint (`TRANSPORT_WIFI` or `TRANSPORT_ETHERNET`, also through a VPN running over
+  /// either), preventing tasks from running over cellular connections even if unmetered.
   /// On older Android versions, it enforces an unmetered network constraint (`NETWORK_TYPE_UNMETERED`).
   /// On iOS, requiring WiFi disables cellular access (`allowsCellularAccess = false`), allowing
   /// execution over any Wi-Fi or Ethernet connection.

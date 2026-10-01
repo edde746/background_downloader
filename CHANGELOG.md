@@ -13,6 +13,7 @@
 * [Desktop] The same storage protection applies to desktop downloads. A volume that does not report its capacity (some network and FUSE mounts) is not checked, and a write that runs out of space fails as a storage error without a native retry, whatever the OS message language
 * [Linux/Desktop] A host without a documents directory (missing `xdg-user-dirs`) no longer hangs startup: the Localstore migration treats it as nothing to migrate and `BaseDownloader.initialize` settles `ready` even when storage init fails
 * [Android] `Config.tempFilePath` is honored for the `.part` file location when set
+* [Android] Tasks requiring Wi-Fi (API 28+) run while a VPN is active and on Ethernet. The 9.6.1 Wi-Fi `NetworkRequest` kept the builder's default `NOT_VPN` capability, so with a VPN up (the app's default network) they waited forever; a VPN now counts as the network it runs over, so cellular, with or without a VPN, still waits
 
 ## 9.6.2
 
