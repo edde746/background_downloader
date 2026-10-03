@@ -58,7 +58,8 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
         }
         val result = super.connectAndProcess(connection)
         if (result == TaskStatus.canceled) {
-            deleteTempFile()
+            // A SAF download writes straight to its destination document, not a temp file
+            cleanup(usesUri, safDestUri)
         }
         if (result == TaskStatus.failed) {
             prepResumeAfterFailure()
@@ -182,9 +183,11 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
                         Log.i(TAG, "Ignoring stale SAF destination Uri $destUri")
                         destUri = null
                     }
-                    // Only a URI recorded for this task's partial output may be reused.
-                    // Never adopt an unrelated document just because its filename matches.
-                    if (!isResume && task.retriesRemaining == task.retries) destUri = null
+                    // Only a run of this task packs a content Uri into its filename (the
+                    // Dart constructor and copyWith never do), so a recorded destination is
+                    // this task's own output: reuse it, truncating unless resuming. A new
+                    // document would be numbered "name (1)" by the provider and orphan
+                    // the partial one.
                     destUri = destUri
                         ?: documentFile?.createFile(task.mimeType, targetFilename)?.uri
                     if (destUri == null) {
@@ -478,11 +481,7 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
                 }
                 // Can't truncate SAF files — if size mismatches, delete and restart
                 Log.i(TAG, "SAF file size $fileSize != required $requiredStartByte, restarting")
-                try {
-                    context.appContext.contentResolver.delete(resumeUri, null, null)
-                } catch (e: Exception) {
-                    Log.i(TAG, "Could not delete SAF file at $resumeUri: ${e.message}")
-                }
+                deleteDestinationUri(resumeUri)
             } catch (e: Exception) {
                 Log.i(TAG, "Could not inspect SAF resume file at $resumeUri: ${e.message}")
             }
@@ -675,11 +674,16 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
 
     /**
      * Deletes the destination Uri at [uri]
+     *
+     * A SAF document is deleted through its provider's deleteDocument, as
+     * DocumentsProvider rejects ContentResolver.delete
      */
     private fun deleteDestinationUri(uri: Uri) {
         try {
             if (uri.scheme == "file") uri.toFile().delete()
-            else context.appContext.contentResolver.delete(uri, null, null)
+            else if (DocumentFile.fromSingleUri(context.appContext, uri)?.delete() != true) {
+                Log.i(TAG, "Could not delete SAF document at $uri")
+            }
         } catch (_: Exception) {
             Log.i(TAG, "Could not delete file at $uri")
         }
