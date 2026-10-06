@@ -1,5 +1,6 @@
 package com.bbflight.background_downloader
 
+import android.content.Context
 import android.net.Uri
 import android.os.Build
 import android.os.ParcelFileDescriptor
@@ -8,7 +9,9 @@ import androidx.core.net.toFile
 import androidx.documentfile.provider.DocumentFile
 import androidx.preference.PreferenceManager
 import com.bbflight.background_downloader.UriUtils.unpack
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.withContext
 import java.io.BufferedInputStream
 import java.io.File
@@ -27,6 +30,23 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
 
     companion object {
         private val contentRangeRegex = Regex("(\\d+)-(\\d+)/(\\d+)")
+
+        /**
+         * Deletes the destination Uri at [uri]
+         *
+         * A SAF document is deleted through its provider's deleteDocument, as
+         * DocumentsProvider rejects ContentResolver.delete
+         */
+        fun deleteDestination(context: Context, uri: Uri) {
+            try {
+                if (uri.scheme == "file") uri.toFile().delete()
+                else if (DocumentFile.fromSingleUri(context, uri)?.delete() != true) {
+                    Log.i(TAG, "Could not delete SAF document at $uri")
+                }
+            } catch (_: Exception) {
+                Log.i(TAG, "Could not delete file at $uri")
+            }
+        }
     }
 
     private var eTagHeader: String? = null
@@ -57,14 +77,44 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
             connection.setRequestProperty("Range", newRangeString)
         }
         val result = super.connectAndProcess(connection)
-        if (result == TaskStatus.canceled) {
+        when (result) {
+            TaskStatus.failed -> when {
+                isInterruptedBySystem -> handOffPartialDownload()
+                BDPlugin.canceledTaskIds.contains(task.taskId) -> cleanup(usesUri, safDestUri)
+                else -> prepResumeAfterFailure()
+            }
             // A SAF download writes straight to its destination document, not a temp file
-            cleanup(usesUri, safDestUri)
-        }
-        if (result == TaskStatus.failed) {
-            prepResumeAfterFailure()
+            TaskStatus.canceled -> cleanup(usesUri, safDestUri)
+            else -> {}
         }
         return result
+    }
+
+    /**
+     * Hand this stopped run's partial file to the task's next run: record where the file ends,
+     * or delete it if the next run cannot resume from it, so that run starts clean
+     */
+    private fun handOffPartialDownload() {
+        val resumeData = if (responseStatusCode == null) {
+            // Stopped before the server answered: the partial file is the one this run resumed
+            if (isResume) ResumeData(task, tempFilePath, requiredStartByte, eTag) else null
+        } else {
+            val partialBytes = bytesTotal + startByte
+            if (serverAcceptsRanges && partialBytes > 0) {
+                ResumeData(task, resumeDataPath(), partialBytes, eTagHeader)
+            } else null
+        }
+        if (resumeData != null) {
+            RunHandoff.store(prefs, resumeData)
+            Log.i(
+                TAG,
+                "Task ${task.taskId} stopped by the system at byte " +
+                        "${resumeData.requiredStartByte}; its next run resumes there"
+            )
+        } else {
+            cleanup(usesUri, safDestUri)
+            Log.i(TAG, "Task ${task.taskId} stopped by the system; its next run starts over")
+        }
     }
 
     /** Process the response to the GET or POST request on this [connection]
@@ -200,6 +250,9 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
                         )
                         return TaskStatus.failed
                     }
+                    // Recorded now, so a stop or cancel before the first write still finds
+                    // the document; also used by resumeDataPath() in pause/failure handlers
+                    safDestUri = destUri
                     val newFilename = getFilenameFromUri(destUri)
                     if (newFilename.isNotEmpty()) {
                         uriFilename = newFilename
@@ -234,39 +287,48 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
                         return TaskStatus.failed
                     } else ParcelFileDescriptor.AutoCloseOutputStream(descriptor)
             }
-            // Store destUri for use by resumeDataPath() in pause/failure handlers
-            safDestUri = destUri
             determineRunInForeground(task, contentLength) // sets 'runInForeground'
             context.updateEstimatedNetworkBytes(contentLength, 0L)
             // transfer the bytes from the server to the output stream
-            val transferBytesResult = outputStream.use { rawOutput ->
-                guardedDownloadOutput(context.appContext, rawOutput, contentLength) {
-                    cleanup(usesUri, destUri)
-                }.use { guardedOutput ->
-                    BufferedInputStream(connection.inputStream).use { inputStream ->
-                        transferBytes(inputStream, guardedOutput, contentLength, task)
+            val transferBytesResult = try {
+                outputStream.use { rawOutput ->
+                    guardedDownloadOutput(context.appContext, rawOutput, contentLength) {
+                        cleanup(usesUri, destUri)
+                    }.use { guardedOutput ->
+                        BufferedInputStream(connection.inputStream).use { inputStream ->
+                            transferBytes(inputStream, guardedOutput, contentLength, task)
+                        }
                     }
                 }
+            } catch (e: CancellationException) {
+                // Stopped by the system after the last byte arrived: the download is complete
+                if (isInterruptedBySystem && contentLength > 0 && bytesTotal == contentLength) {
+                    TaskStatus.complete
+                } else throw e
             }
             // act on the result of the bytes transfer
             when (transferBytesResult) {
                 TaskStatus.complete -> {
-                    if (tempFile == null) {
-                        Log.i(
-                            TAG, "Successfully downloaded taskId ${task.taskId} to URI $destUri"
-                        )
-                    } else {
-                        // move file from its temp location to the destination
-                        val destFile = File(destFilePath)
-                        val dir = destFile.parentFile!!
-                        if (!dir.exists()) {
-                            dir.mkdirs()
+                    // Finished even if this run is being stopped: a stop must not cost a
+                    // download whose bytes have all arrived
+                    withContext(NonCancellable) {
+                        if (tempFile == null) {
+                            Log.i(
+                                TAG, "Successfully downloaded taskId ${task.taskId} to URI $destUri"
+                            )
+                        } else {
+                            // move file from its temp location to the destination
+                            val destFile = File(destFilePath)
+                            val dir = destFile.parentFile!!
+                            if (!dir.exists()) {
+                                dir.mkdirs()
+                            }
+                            moveCompletedDownload(tempFile, destFile)
+                            setFileOwnership(destFile)
+                            Log.i(
+                                TAG, "Successfully downloaded taskId ${task.taskId} to $destFilePath"
+                            )
                         }
-                        moveCompletedDownload(tempFile, destFile)
-                        setFileOwnership(destFile)
-                        Log.i(
-                            TAG, "Successfully downloaded taskId ${task.taskId} to $destFilePath"
-                        )
                     }
                     return TaskStatus.complete
                 }
@@ -445,14 +507,26 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
      * given [tempFilePath] and [requiredStartByte]
      * */
     override fun determineIfResume(): Boolean {
-        // set tempFilePath from resume data, or "" if a new tempFile is needed
-        requiredStartByte = context.getInputLong(keyStartByte, 0)
-        if (requiredStartByte == 0L) {
-            return false
+        // A run the platform stopped records where its partial file ends. The platform runs the
+        // task again with its original input, so that record is newer than any resume data there
+        val handoff = RunHandoff.take(prefs, task.taskId)
+        if (handoff != null) {
+            // The stopped run may have named the file, and for SAF packed its document Uri
+            // into the filename
+            task = task.copyWith(filename = handoff.task.filename)
+            requiredStartByte = handoff.requiredStartByte
+            eTag = handoff.eTag
+            tempFilePath = handoff.data
+        } else {
+            // set tempFilePath from resume data, or "" if a new tempFile is needed
+            requiredStartByte = context.getInputLong(keyStartByte, 0)
+            if (requiredStartByte == 0L) {
+                return false
+            }
+            eTag = context.getInputString(keyETag)
+            tempFilePath = if (requiredStartByte > 0) context.getInputString(keyResumeDataData) ?: ""
+            else ""
         }
-        eTag = context.getInputString(keyETag)
-        tempFilePath = if (requiredStartByte > 0) context.getInputString(keyResumeDataData) ?: ""
-        else ""
 
         val resumeUri = Uri.parse(tempFilePath)
         // file:// destination URI: the partial bytes live in the destination file
@@ -672,22 +746,8 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
     }
 
 
-    /**
-     * Deletes the destination Uri at [uri]
-     *
-     * A SAF document is deleted through its provider's deleteDocument, as
-     * DocumentsProvider rejects ContentResolver.delete
-     */
-    private fun deleteDestinationUri(uri: Uri) {
-        try {
-            if (uri.scheme == "file") uri.toFile().delete()
-            else if (DocumentFile.fromSingleUri(context.appContext, uri)?.delete() != true) {
-                Log.i(TAG, "Could not delete SAF document at $uri")
-            }
-        } catch (_: Exception) {
-            Log.i(TAG, "Could not delete file at $uri")
-        }
-    }
+    /** Deletes the destination Uri at [uri] */
+    private fun deleteDestinationUri(uri: Uri) = deleteDestination(context.appContext, uri)
 
     /**
      * Cleanup by deleting the temp file or destination uri

@@ -8,8 +8,10 @@ import android.os.Build
 import android.os.PersistableBundle
 import android.util.Log
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.job
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.Json
 
@@ -57,29 +59,52 @@ class UIDTJobService : JobService() {
         }
 
         jobContexts[params.jobId] = jobContext
-        val job = CoroutineScope(Dispatchers.IO).launch {
+        val job = CoroutineScope(Dispatchers.IO).launch(start = CoroutineStart.LAZY) {
             try {
                 runner.run()
                 Log.d(TaskRunner.TAG, "UIDT JobService finished for taskId ${jobContext.task.taskId}")
             } finally {
-                jobs.remove(params.jobId)
-                jobContexts.remove(params.jobId)
-                jobFinished(params, false) // retries managed internally
+                // A task enqueued again after a stop keeps its job id, so its next run may
+                // already be in these maps: remove only this run's entries
+                jobs.remove(params.jobId, coroutineContext.job)
+                jobContexts.remove(params.jobId, jobContext)
+                // After onStopJob, JobScheduler has already finished the job
+                if (!jobContext.isStopped) {
+                    jobFinished(params, false) // retries managed internally
+                }
             }
         }
         jobs[params.jobId] = job
+        job.start()
 
         return true // Work is still running on background thread
     }
 
     override fun onStopJob(params: JobParameters?): Boolean {
-        Log.i(TaskRunner.TAG, "Stopping UIDT JobService")
-        if (params != null) {
-            jobContexts[params.jobId]?.isStopped = true
-            jobs.remove(params.jobId)?.cancel()
-            jobContexts.remove(params.jobId)
+        if (params == null) return false
+        val stopReason = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) params.stopReason
+        else JobParameters.STOP_REASON_UNDEFINED
+        Log.i(TaskRunner.TAG, "Stopping UIDT JobService, stop reason $stopReason")
+        jobContexts[params.jobId]?.let {
+            it.stopReason = stopReason
+            it.isStopped = true
         }
-        return false // Do not reschedule automatically; background_downloader manages retries internally
+        jobs.remove(params.jobId)?.cancel()
+        jobContexts.remove(params.jobId)
+        // Not rescheduled by JobScheduler, which starts a rescheduled job only at its next
+        // re-evaluation of jobs (minutes later on an idle device): the runner enqueues a task
+        // the system stopped again itself
+        return false
+    }
+
+    companion object {
+        /**
+         * Whether the task continues after its job was stopped for [stopReason]: only the app
+         * canceling the job or the user stopping it ends the task
+         */
+        fun continuesAfter(stopReason: Int) =
+            stopReason != JobParameters.STOP_REASON_CANCELLED_BY_APP &&
+                    stopReason != JobParameters.STOP_REASON_USER
     }
 
     /**
@@ -98,6 +123,21 @@ class UIDTJobService : JobService() {
 
         @Volatile
         var isStopped: Boolean = false
+
+        @Volatile
+        var stopReason: Int = JobParameters.STOP_REASON_UNDEFINED
+
+        override val willRunAgain: Boolean
+            get() = isStopped && continuesAfter(stopReason)
+
+        override val platformStopReason: Int
+            get() = stopReason
+
+        override suspend fun runAgain() =
+            BDPlugin.doEnqueue(appContext, task, notificationConfigJsonString, null)
+
+        // Nothing to cancel: JobScheduler never reschedules these jobs
+        override suspend fun cancelRunAgain() {}
 
         override val appContext: Context
             get() = service.applicationContext

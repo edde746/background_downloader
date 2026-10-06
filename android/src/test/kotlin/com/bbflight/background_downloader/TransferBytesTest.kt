@@ -19,6 +19,10 @@ class TransferBytesTest {
         override var taskCanResume: Boolean = false
         override var notificationConfigJsonString: String? = null
         override val isTaskStopped: Boolean = false
+        override val willRunAgain: Boolean = false
+        override val platformStopReason: Int = 0
+        override suspend fun runAgain() = true
+        override suspend fun cancelRunAgain() {}
         override var runInForeground: Boolean = false
         override val isActive: Boolean = true
 

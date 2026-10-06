@@ -55,6 +55,25 @@ interface TaskJobContext {
     var notificationConfigJsonString: String?
     val isTaskStopped: Boolean
 
+    /**
+     * True if the system stopped this run without the task being canceled, so the task
+     * continues in another run: WorkManager reschedules work it stops for quota, constraints or
+     * device state, and a user-initiated job the system stops is enqueued again by [runAgain]
+     */
+    val willRunAgain: Boolean
+
+    /** The platform's reason for stopping this run, for logging */
+    val platformStopReason: Int
+
+    /**
+     * Make sure the task runs again after this run was stopped (see [willRunAgain]), returning
+     * false if that failed
+     */
+    suspend fun runAgain(): Boolean
+
+    /** Cancel the run the platform scheduled after stopping this one, if it scheduled one */
+    suspend fun cancelRunAgain()
+
     // Foreground control
     var runInForeground: Boolean
     val isActive: Boolean // maps to !isStopped or Service state
@@ -267,6 +286,13 @@ open class TaskRunner(
                         )
                     }
                 }
+                // A stopped run's record is obsolete once the task has ended, and a canceled
+                // task also loses the partial file it points to
+                RunHandoff.take(prefs, task.taskId)?.let { handoff ->
+                    if (modifiedStatus == TaskStatus.canceled) {
+                        RunHandoff.deletePartialFile(context, handoff)
+                    }
+                }
                 QueueService.cleanupTaskId(task.taskId)
                 if (!retryNeeded && task.options?.hasOnFinishCallback() == true) {
                     Callbacks.invokeOnTaskFinishedCallback(context, taskStatusUpdate)
@@ -435,6 +461,13 @@ open class TaskRunner(
     val isActive: Boolean
         get() = !hasDeliveredResult && context.isActive
 
+    /**
+     * True if the platform stopped this run and will run the task again (see
+     * [TaskJobContext.willRunAgain]), and the task was not canceled meanwhile
+     */
+    val isInterruptedBySystem: Boolean
+        get() = context.willRunAgain && !BDPlugin.canceledTaskIds.contains(task.taskId)
+
     lateinit var prefs: SharedPreferences
 
     /**
@@ -444,6 +477,19 @@ open class TaskRunner(
         prefs = PreferenceManager.getDefaultSharedPreferences(context.appContext)
         runInForegroundFileSize =
             prefs.getInt(BDPlugin.keyConfigForegroundFileSize, -1)
+        val taskId = context.task.taskId
+        // A run the platform stopped may still be unwinding: wait for it, so this run never
+        // writes alongside it and sees where it left the partial file
+        val turn = RunHandoff.awaitTurn(taskId)
+        try {
+            runTask()
+        } finally {
+            RunHandoff.endTurn(taskId, turn)
+        }
+        hasDeliveredResult = true
+    }
+
+    private suspend fun runTask() {
         withContext(Dispatchers.IO) {
             task = context.task
             val isExpedited = task.priority < 5 && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
@@ -508,6 +554,19 @@ open class TaskRunner(
             } finally {
                 withContext(NonCancellable) {
                     // NonCancellable to make sure we clean up even if job is being cancelled
+                    if (status == TaskStatus.failed && isInterruptedBySystem) {
+                        // The task continues in its next run, so it is not reported and keeps
+                        // its holding queue slot
+                        if (context.runAgain()) {
+                            Log.i(
+                                TAG,
+                                "Task ${task.taskId} was stopped by the system (stop reason " +
+                                        "${context.platformStopReason}) and will run again"
+                            )
+                            return@withContext
+                        }
+                        Log.w(TAG, "Task ${task.taskId} was stopped by the system and could not be enqueued again")
+                    }
                     processStatusUpdate(
                         task,
                         status,
@@ -529,10 +588,14 @@ open class TaskRunner(
                         // except TaskStatus.canceled is handled directly in cancellation and reset methods
                         BDPlugin.holdingQueue?.taskFinished(task)
                     }
+                    if (isInterruptedBySystem) {
+                        // The run reached an outcome (e.g. completed while being stopped), so
+                        // the run the platform scheduled after the stop must not repeat it
+                        context.cancelRunAgain()
+                    }
                 }
             }
         }
-        hasDeliveredResult = true
     }
 
     /** Return true if resume is possible - defaults to false */
@@ -620,6 +683,11 @@ open class TaskRunner(
             }
             return process(connection)
         } catch (e: Exception) {
+            if (isInterruptedBySystem) {
+                // Not a cancel: the task continues in its next run, which [run] arranges
+                Log.i(TAG, "Task ${task.taskId} was stopped by the system, ignoring exception: ${e.message}")
+                return TaskStatus.failed
+            }
             if (context.isTaskStopped || BDPlugin.canceledTaskIds.contains(task.taskId)) {
                 Log.i(TAG, "Task ${task.taskId} was canceled, ignoring exception: ${e.message}")
                 return TaskStatus.canceled

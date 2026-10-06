@@ -15,6 +15,7 @@
 * [Android] `Config.tempFilePath` is honored for the `.part` file location when set
 * [Android] Tasks requiring Wi-Fi (API 28+) run while a VPN is active and on Ethernet. The 9.6.1 Wi-Fi `NetworkRequest` kept the builder's default `NOT_VPN` capability, so with a VPN up (the app's default network) they waited forever; a VPN now counts as the network it runs over, so cellular, with or without a VPN, still waits
 * [Android] SAF downloads no longer leave numbered copies of their partial file. A retried or resumed task writes to the document its earlier run created instead of a new `name (1)` sibling, and partial documents are deleted through the provider; `ContentResolver.delete`, which `DocumentsProvider` rejects, left them behind on cancel, a rejected resume, and storage refusal
+* [Android] A download the system stops (job quota, lost network, device state) continues from where it stopped instead of ending as `canceled` with its partial file deleted. Since upstream 9.6.0 every WorkManager or JobScheduler stop was reported as a cancellation, while WorkManager still reran the stopped work from zero beside the app's own retry; on Android 16, which applies job quota once the app leaves the foreground, downloads restarted each time the app was backgrounded. The stopped run now records its offset and the next run of the task (WorkManager's rerun, or the task enqueued again for a user-initiated job) waits for it and resumes there; a stop after the last byte arrived completes the download
 
 ## 9.6.2
 

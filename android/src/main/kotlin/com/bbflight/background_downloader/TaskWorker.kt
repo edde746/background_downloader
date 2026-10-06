@@ -1,12 +1,17 @@
 package com.bbflight.background_downloader
 
+import android.annotation.SuppressLint
 import android.app.Notification
 import android.content.Context
 import android.content.SharedPreferences
 import androidx.preference.PreferenceManager
 import androidx.work.CoroutineWorker
 import androidx.work.ForegroundInfo
+import androidx.work.WorkInfo
+import androidx.work.WorkManager
 import androidx.work.WorkerParameters
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import android.util.Log
 
@@ -83,7 +88,28 @@ open class TaskWorker(
     override val isTaskStopped: Boolean
         get() = isStopped
 
+    // WorkManager reschedules stopped work unless the stop canceled it. [getStopReason] is a
+    // field read: WorkManager records stop reasons on every API level, cancellation included
+    override val willRunAgain: Boolean
+        @SuppressLint("NewApi")
+        get() = isStopped && stopReason != WorkInfo.STOP_REASON_CANCELLED_BY_APP
 
+    override val platformStopReason: Int
+        @SuppressLint("NewApi")
+        get() = stopReason
+
+    // WorkManager has already rescheduled the work it stopped
+    override suspend fun runAgain() = true
+
+    override suspend fun cancelRunAgain() {
+        withContext(Dispatchers.IO) {
+            try {
+                WorkManager.getInstance(applicationContext).cancelWorkById(id).result.get()
+            } catch (e: Exception) {
+                Log.w(TaskRunner.TAG, "Could not cancel the next run of taskId ${task.taskId}: $e")
+            }
+        }
+    }
 
     override val isActive: Boolean
         get() = !isTaskStopped
