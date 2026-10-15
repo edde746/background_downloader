@@ -293,6 +293,8 @@ open class TaskRunner(
                         RunHandoff.deletePartialFile(context, handoff)
                     }
                 }
+                // Later runs (retry, resume) carry the document in the task's filename
+                RunHandoff.forgetDestination(prefs, task.taskId)
                 QueueService.cleanupTaskId(task.taskId)
                 if (!retryNeeded && task.options?.hasOnFinishCallback() == true) {
                     Callbacks.invokeOnTaskFinishedCallback(context, taskStatusUpdate)

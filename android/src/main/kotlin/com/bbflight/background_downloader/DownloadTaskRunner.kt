@@ -237,9 +237,16 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
                     // Dart constructor and copyWith never do), so a recorded destination is
                     // this task's own output: reuse it, truncating unless resuming. A new
                     // document would be numbered "name (1)" by the provider and orphan
-                    // the partial one.
-                    destUri = destUri
-                        ?: documentFile?.createFile(task.mimeType, targetFilename)?.uri
+                    // the partial one. A run that died with its process packed the Uri only
+                    // in memory, so the run replacing it finds the document by task id.
+                    if (destUri == null) {
+                        destUri = RunHandoff.recordedDestination(prefs, task.taskId)
+                            ?.takeIf { safFileExists(it) }
+                    }
+                    if (destUri == null) {
+                        destUri = documentFile?.createFile(task.mimeType, targetFilename)?.uri
+                        destUri?.let { RunHandoff.recordDestination(prefs, task.taskId, it) }
+                    }
                     if (destUri == null) {
                         val message =
                             "Failed to create document within directory with URI: $directoryUri"

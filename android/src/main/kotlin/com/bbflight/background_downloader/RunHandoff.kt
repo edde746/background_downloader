@@ -9,6 +9,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.serialization.encodeToString
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
+import kotlin.concurrent.read
 import kotlin.concurrent.write
 
 /**
@@ -21,9 +22,13 @@ import kotlin.concurrent.write
  *
  * Runs of a task therefore take turns ([awaitTurn], [endTurn]), and a stopped download records
  * where its partial file ends ([store]) for the next run to resume from ([take]).
+ *
+ * A run that dies with its process records nothing when it stops, so a SAF download also records
+ * the document it creates ([recordDestination]) for a run replacing it to write to again.
  */
 object RunHandoff {
     private const val keyHandoffMap = "com.bbflight.background_downloader.runHandoffMap"
+    private const val keyDestinationMap = "com.bbflight.background_downloader.runDestinationMap"
 
     private val turns = ConcurrentHashMap<String, CompletableDeferred<Unit>>()
 
@@ -54,7 +59,7 @@ object RunHandoff {
     /** Record [resumeData] for the next run of its task, replacing any earlier record */
     fun store(prefs: SharedPreferences, resumeData: ResumeData) {
         BDPlugin.prefsLock.write {
-            val handoffs = readHandoffs(prefs)
+            val handoffs = readMap(prefs, keyHandoffMap)
             handoffs[resumeData.task.taskId] = bdJson.encodeToString(resumeData)
             // committed synchronously: the process may be frozen or killed right after a stop
             prefs.edit(commit = true) { putString(keyHandoffMap, bdJson.encodeToString(handoffs)) }
@@ -63,17 +68,39 @@ object RunHandoff {
 
     /** Remove and return the record for [taskId], or null if there is none */
     fun take(prefs: SharedPreferences, taskId: String): ResumeData? {
-        val json = BDPlugin.prefsLock.write {
-            val handoffs = readHandoffs(prefs)
-            val json = handoffs.remove(taskId) ?: return null
-            prefs.edit(commit = true) { putString(keyHandoffMap, bdJson.encodeToString(handoffs)) }
-            json
-        }
+        val json = takeEntry(prefs, keyHandoffMap, taskId) ?: return null
         return try {
             bdJson.decodeFromString<ResumeData>(json)
         } catch (_: Exception) {
             null
         }
+    }
+
+    /**
+     * Record [uri] as the SAF document runs of [taskId] write to
+     *
+     * A run packs its document Uri into the task's filename, but only in memory. If the process
+     * dies, the platform runs the task again with its original input, and creating the document
+     * again would make the provider number a copy ("name (1)") beside the partial one.
+     */
+    fun recordDestination(prefs: SharedPreferences, taskId: String, uri: Uri) {
+        BDPlugin.prefsLock.write {
+            val destinations = readMap(prefs, keyDestinationMap)
+            destinations[taskId] = uri.toString()
+            // committed synchronously: the record must outlive a process that dies right after
+            prefs.edit(commit = true) {
+                putString(keyDestinationMap, bdJson.encodeToString(destinations))
+            }
+        }
+    }
+
+    /** The SAF document an earlier run of [taskId] created, or null if there is none */
+    fun recordedDestination(prefs: SharedPreferences, taskId: String): Uri? =
+        BDPlugin.prefsLock.read { readMap(prefs, keyDestinationMap)[taskId] }?.let(Uri::parse)
+
+    /** Remove the SAF document recorded for [taskId], once the task has ended */
+    fun forgetDestination(prefs: SharedPreferences, taskId: String) {
+        takeEntry(prefs, keyDestinationMap, taskId)
     }
 
     /** Delete the partial file or document [resumeData] points to */
@@ -86,6 +113,16 @@ object RunHandoff {
         }
     }
 
-    private fun readHandoffs(prefs: SharedPreferences): MutableMap<String, String> =
-        bdJson.decodeFromString(prefs.getString(keyHandoffMap, "{}") ?: "{}")
+    /** Remove and return the entry for [taskId] in the map stored under [key] */
+    private fun takeEntry(prefs: SharedPreferences, key: String, taskId: String): String? {
+        BDPlugin.prefsLock.write {
+            val entries = readMap(prefs, key)
+            val entry = entries.remove(taskId) ?: return null
+            prefs.edit(commit = true) { putString(key, bdJson.encodeToString(entries)) }
+            return entry
+        }
+    }
+
+    private fun readMap(prefs: SharedPreferences, key: String): MutableMap<String, String> =
+        bdJson.decodeFromString(prefs.getString(key, "{}") ?: "{}")
 }
