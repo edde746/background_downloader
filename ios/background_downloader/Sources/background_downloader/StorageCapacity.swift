@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+import os.log
 
 /// A capacity refusal is terminal, including when the volume cannot be queried.
 struct DownloadStorageError: LocalizedError {
@@ -32,16 +33,57 @@ private func existingStorageURL(_ url: URL) -> URL {
     return ancestor.resolvingSymlinksInPath()
 }
 
+/// iOS frees purgeable space (caches, offloaded app data) on demand, so
+/// `.volumeAvailableCapacityKey` can read far below what Settings shows
+/// (Plezy #2876: 302 GB free in Settings, every large episode refused).
+/// `.volumeAvailableCapacityForImportantUsageKey` is Apple's figure for data
+/// the user explicitly asked for, but one query costs milliseconds where the
+/// plain key is a cached read, and these checks run on every progress callback
+/// and every 256 KiB copy block. Measure it only when the plain figure would
+/// refuse, and reuse the headroom it adds for a few seconds: the live plain
+/// figure keeps tracking what writes consume.
+private let purgeableHeadroomLifetime: TimeInterval = 5
+private let purgeableHeadroomLock = NSLock()
+private var purgeableHeadroomByVolume = [URL: (bytes: Int64, measuredAt: TimeInterval)]()
+
+private func cachedPurgeableHeadroom(on volume: URL) -> Int64? {
+    purgeableHeadroomLock.lock()
+    defer { purgeableHeadroomLock.unlock() }
+    guard let cached = purgeableHeadroomByVolume[volume],
+          ProcessInfo.processInfo.systemUptime - cached.measuredAt < purgeableHeadroomLifetime else { return nil }
+    return cached.bytes
+}
+
+/// Zero when the important-usage figure is unavailable, which keeps the
+/// plain-key behaviour.
+private func measurePurgeableHeadroom(at url: URL, on volume: URL) -> Int64 {
+    var fresh = url
+    fresh.removeAllCachedResourceValues()
+    let values = try? fresh.resourceValues(forKeys: [
+        .volumeAvailableCapacityForImportantUsageKey, .volumeAvailableCapacityKey
+    ])
+    var headroom: Int64 = 0
+    if let important = values?.volumeAvailableCapacityForImportantUsage,
+       let available = values?.volumeAvailableCapacity {
+        headroom = max(0, important - Int64(available))
+    }
+    purgeableHeadroomLock.lock()
+    purgeableHeadroomByVolume[volume] = (headroom, ProcessInfo.processInfo.systemUptime)
+    purgeableHeadroomLock.unlock()
+    return headroom
+}
+
 /// Live free bytes already reflect downloaded data; charge only this operation's
 /// remaining bytes. Never sum tasks (which can reside on different volumes).
 func checkDownloadStorage(at url: URL, remainingBytes: Int64 = 0) throws {
     let config = UserDefaults.standard.integer(forKey: BDPlugin.keyConfigCheckAvailableSpace)
     guard config == -1 || config > 0 else { return }
     do {
-        let values = try existingStorageURL(url).resourceValues(forKeys: [
-            .volumeAvailableCapacityKey, .volumeTotalCapacityKey
+        let storageURL = existingStorageURL(url)
+        let values = try storageURL.resourceValues(forKeys: [
+            .volumeAvailableCapacityKey, .volumeTotalCapacityKey, .volumeURLKey
         ])
-        guard let free = values.volumeAvailableCapacity, free >= 0,
+        guard let available = values.volumeAvailableCapacity, available >= 0,
               let total = values.volumeTotalCapacity, total > 0 else {
             throw DownloadStorageError(message: "Download storage capacity could not be determined for \(url.path)")
         }
@@ -51,9 +93,22 @@ func checkDownloadStorage(at url: URL, remainingBytes: Int64 = 0) throws {
         } else {
             floor = Int64(min(config, Int(Int64.max / (1024 * 1024)))) * 1024 * 1024
         }
-        guard Int64(free) >= floor, max(0, remainingBytes) <= Int64(free) - floor else {
-            throw DownloadStorageError(message: "Insufficient space to store the downloaded file on \(url.path)")
+        let needed = max(0, remainingBytes)
+        let fits = { (free: Int64) in free >= floor && needed <= free - floor }
+        let plainFree = Int64(available)
+        if fits(plainFree) { return }
+        let volume = values.volume ?? storageURL
+        if let headroom = cachedPurgeableHeadroom(on: volume), fits(plainFree + headroom) { return }
+        let headroom = measurePurgeableHeadroom(at: storageURL, on: volume)
+        let free = plainFree + headroom
+        guard fits(free) else {
+            os_log("Refusing download storage on %@: %lld bytes free (%lld purgeable), floor %lld, %lld needed",
+                   log: log, type: .error, url.path, free, headroom, floor, needed)
+            throw DownloadStorageError(message: "Insufficient space to store the downloaded file on \(url.path): " +
+                "\(free) bytes free, floor \(floor), \(needed) needed")
         }
+        os_log("Download storage on %@ fits only with purgeable space: %lld bytes free (%lld purgeable), floor %lld, %lld needed",
+               log: log, type: .default, url.path, free, headroom, floor, needed)
     } catch let error as DownloadStorageError {
         throw error
     } catch {
