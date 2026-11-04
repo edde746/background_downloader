@@ -91,6 +91,36 @@ void main() {
     expect(await file.length(), StorageSpaceGuard.writeSize);
   });
 
+  test('small events sample capacity once per window and stop at its end',
+      () async {
+    final directory = await Directory.systemTemp.createTemp('bd_capacity_');
+    addTearDown(() => directory.delete(recursive: true));
+    final file = File('${directory.path}/partial');
+    final sink = file.openWrite();
+    sink.done.ignore();
+    var samples = 0;
+    final guard = StorageSpaceGuard(file.path, -1, capacity: (_) {
+      samples++;
+      return (
+        available: 256 * _mib + (samples <= 2 ? _mib : 0),
+        total: 10 * 1024 * _mib,
+      );
+    });
+    // Network-sized events that straddle the window boundary.
+    final event = Uint8List(5000);
+    Future<void> transfer() async {
+      for (var written = 0; written < 3 * _mib; written += event.length) {
+        await guard.write(sink, event);
+      }
+    }
+
+    await expectLater(
+        transfer(), throwsA(predicate(isDownloadStorageFailure)));
+    await sink.close();
+    expect(samples, 3);
+    expect(await file.length(), 2 * StorageSpaceGuard.writeSize);
+  });
+
   test('copy refusal retains source and unrelated completed destination',
       () async {
     final directory = await Directory.systemTemp.createTemp('bd_capacity_');

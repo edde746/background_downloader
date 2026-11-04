@@ -37,7 +37,8 @@ bool isOutOfSpaceError(Object error) {
   return Platform.isWindows ? code == 39 || code == 112 : code == 28;
 }
 
-/// Checks actual target-volume capacity before each bounded, drained write.
+/// Samples actual target-volume capacity once per [writeSize] window of
+/// drained writes.
 ///
 /// A volume that cannot report its capacity (some network and FUSE mounts
 /// report zero) is not checked; a write that then runs out of space still
@@ -89,16 +90,29 @@ class StorageSpaceGuard {
     );
   }
 
+  /// Bytes the last [write] capacity sample reserved that are not yet written.
+  var _reserved = 0;
+
+  /// Samples capacity per [writeSize] window, not per event: a sample costs
+  /// several filesystem calls (two handle opens on Windows), and the 4-16 KiB
+  /// events of a network stream made it the transfer bottleneck.
   Future<void> write(IOSink sink, List<int> bytes) async {
-    for (var offset = 0; offset < bytes.length; offset += writeSize) {
-      final end = min(offset + writeSize, bytes.length);
-      check(end - offset);
+    for (var offset = 0; offset < bytes.length;) {
+      if (_reserved == 0) {
+        check(writeSize);
+        _reserved = writeSize;
+      }
+      final end = min(offset + _reserved, bytes.length);
       sink.add(offset == 0 && end == bytes.length
           ? bytes
           : bytes is Uint8List
               ? Uint8List.sublistView(bytes, offset, end)
               : bytes.sublist(offset, end));
-      // Bound queued writes, so the next capacity sample accounts for this one.
+      _reserved -= end - offset;
+      offset = end;
+      // Drain every write, so the next sample accounts for it and buffering
+      // stays bounded. A write error raised while no flush is pending would
+      // leave the next IOSink.flush pending forever.
       await sink.flush();
     }
   }
