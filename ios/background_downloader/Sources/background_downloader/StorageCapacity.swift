@@ -32,13 +32,59 @@ private func existingStorageURL(_ url: URL) -> URL {
     return ancestor.resolvingSymlinksInPath()
 }
 
+/// Capacity for important usage adds space the system purges on demand for
+/// content the user asked for (caches, optimized photos, offloaded apps).
+/// volumeAvailableCapacity leaves it out and can trail the figure Settings
+/// shows by hundreds of GB. The query costs milliseconds instead of
+/// microseconds, so it is consulted only when plain free space refuses, and a
+/// sample serves for a short time, charged with the bytes written since. A
+/// refusal always rests on a fresh sample.
+private final class ImportantUsageCapacity {
+    static let shared = ImportantUsageCapacity()
+    private static let maxAge: TimeInterval = 30
+    private struct Sample {
+        let important: Int64
+        let plain: Int64
+        let time: TimeInterval
+    }
+    private let lock = NSLock()
+    private var samples: [URL: Sample] = [:]
+
+    /// Important-usage capacity of the volume containing [url], an existing
+    /// path; nil when the volume does not report it.
+    func estimate(at url: URL, plain: Int64, fits: (Int64) -> Bool) -> Int64? {
+        let volume = (try? url.resourceValues(forKeys: [.volumeURLKey]).volume) ?? url
+        let now = ProcessInfo.processInfo.systemUptime
+        lock.lock()
+        let cached = samples[volume]
+        lock.unlock()
+        if let cached = cached, now - cached.time < Self.maxAge {
+            let estimate = cached.important - max(0, cached.plain - plain)
+            if fits(estimate) { return estimate }
+        }
+        // A fresh URL, so no resource value cached by an earlier query applies.
+        let important = (try? URL(fileURLWithPath: url.path).resourceValues(forKeys: [
+            .volumeAvailableCapacityForImportantUsageKey
+        ]))?.volumeAvailableCapacityForImportantUsage
+        lock.lock()
+        defer { lock.unlock() }
+        guard let important = important, important > 0 else {
+            samples[volume] = nil
+            return nil
+        }
+        samples[volume] = Sample(important: important, plain: plain, time: now)
+        return important
+    }
+}
+
 /// Live free bytes already reflect downloaded data; charge only this operation's
 /// remaining bytes. Never sum tasks (which can reside on different volumes).
 func checkDownloadStorage(at url: URL, remainingBytes: Int64 = 0) throws {
     let config = UserDefaults.standard.integer(forKey: BDPlugin.keyConfigCheckAvailableSpace)
     guard config == -1 || config > 0 else { return }
     do {
-        let values = try existingStorageURL(url).resourceValues(forKeys: [
+        let storageURL = existingStorageURL(url)
+        let values = try storageURL.resourceValues(forKeys: [
             .volumeAvailableCapacityKey, .volumeTotalCapacityKey
         ])
         guard let free = values.volumeAvailableCapacity, free >= 0,
@@ -51,9 +97,13 @@ func checkDownloadStorage(at url: URL, remainingBytes: Int64 = 0) throws {
         } else {
             floor = Int64(min(config, Int(Int64.max / (1024 * 1024)))) * 1024 * 1024
         }
-        guard Int64(free) >= floor, max(0, remainingBytes) <= Int64(free) - floor else {
-            throw DownloadStorageError(message: "Insufficient space to store the downloaded file on \(url.path)")
-        }
+        let needed = max(0, remainingBytes)
+        let fits = { (available: Int64) in available >= floor && needed <= available - floor }
+        if fits(Int64(free)) { return }
+        let important = ImportantUsageCapacity.shared.estimate(at: storageURL, plain: Int64(free), fits: fits)
+        if let important = important, fits(important) { return }
+        // Figures first: hosts may truncate the description.
+        throw DownloadStorageError(message: "Insufficient space to store the downloaded file: needs \(needed) bytes above a reserve of \(floor) bytes; \(free) bytes free, \(important.map { String($0) } ?? "unknown") for important usage, on \(url.path)")
     } catch let error as DownloadStorageError {
         throw error
     } catch {

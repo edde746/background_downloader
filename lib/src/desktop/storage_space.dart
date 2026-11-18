@@ -13,7 +13,18 @@ final _log = Logger('FileDownloader');
 /// Live capacity on the filesystem containing [path], including mounted volumes.
 /// The native APIs return bytes available to this user, not privileged free space.
 /// Throws when the filesystem cannot be queried.
-({int available, int total}) desktopVolumeCapacity(String path) {
+({int available, int total}) desktopVolumeCapacity(String path) =>
+    _NativeCapacity.instance.query(_existingDirectory(path));
+
+/// macOS capacity for important usage on the volume containing [path]: free
+/// space plus what the system purges on demand for content the user asked for
+/// (caches, local snapshots, optimized iCloud files), which plain free space
+/// leaves out. Null on other platforms and on volumes that do not report it.
+int? desktopImportantCapacity(String path) => Platform.isMacOS
+    ? _NativeCapacity.instance.importantUsage(_existingDirectory(path))
+    : null;
+
+String _existingDirectory(String path) {
   var directory = Directory(path).absolute;
   if (FileSystemEntity.isFileSync(directory.path)) {
     directory = File(File(directory.path).resolveSymbolicLinksSync()).parent;
@@ -25,7 +36,7 @@ final _log = Logger('FileDownloader');
     }
     directory = parent;
   }
-  return _NativeCapacity.instance.query(directory.resolveSymbolicLinksSync());
+  return directory.resolveSymbolicLinksSync();
 }
 
 /// Whether [error] is the filesystem refusing a write for lack of space.
@@ -45,15 +56,29 @@ bool isOutOfSpaceError(Object error) {
 /// fails as a storage failure through [isOutOfSpaceError].
 class StorageSpaceGuard {
   static const writeSize = 1024 * 1024;
+
+  /// How long an important-usage sample stands in for a fresh query.
+  static const importantSampleAge = Duration(seconds: 30);
   final String path;
   final int configuration;
   final ({int available, int total}) Function(String) _capacity;
+  final int? Function(String)? _importantCapacity;
+  final DateTime Function() _clock;
 
+  /// An injected [capacity] replaces the native queries, so [importantCapacity]
+  /// then defaults to none.
   StorageSpaceGuard(
     this.path,
     this.configuration, {
     ({int available, int total}) Function(String)? capacity,
-  }) : _capacity = capacity ?? desktopVolumeCapacity;
+    int? Function(String)? importantCapacity,
+    DateTime Function()? clock,
+  })  : _capacity = capacity ?? desktopVolumeCapacity,
+        _importantCapacity = importantCapacity ??
+            (capacity == null && Platform.isMacOS
+                ? desktopImportantCapacity
+                : null),
+        _clock = clock ?? DateTime.now;
 
   void check([int requiredBytes = 0]) {
     if (configuration == 0) return;
@@ -73,11 +98,50 @@ class StorageSpaceGuard {
     final floor = configuration < 0
         ? max(256 * 1024 * 1024, capacity.total ~/ 100)
         : configuration * 1024 * 1024;
-    if (capacity.available - max(0, requiredBytes) < floor) {
-      throw TaskFileSystemException(
-        'Insufficient space to store download on $path',
-      );
+    final needed = max(0, requiredBytes);
+    bool fits(int available) => available - needed >= floor;
+    if (fits(capacity.available)) return;
+    final important = _importantEstimate(capacity.available, fits);
+    if (important != null && fits(important)) return;
+    // Figures first: hosts may truncate the description.
+    throw TaskFileSystemException(
+      'Insufficient space to store download: needs $needed bytes above a '
+      'reserve of $floor bytes; ${capacity.available} bytes free, '
+      '${important ?? 'unknown'} for important usage, on $path',
+    );
+  }
+
+  ({int important, int available, DateTime time})? _importantSample;
+
+  /// Capacity for important usage, consulted only when plain free space
+  /// refuses: its query costs milliseconds, against microseconds for plain
+  /// free space. A sample serves for [importantSampleAge], charged with the
+  /// bytes written since; a refusal always rests on a fresh sample.
+  int? _importantEstimate(int available, bool Function(int) fits) {
+    final query = _importantCapacity;
+    if (query == null) return null;
+    final now = _clock();
+    final sample = _importantSample;
+    if (sample != null) {
+      final age = now.difference(sample.time);
+      if (!age.isNegative && age < importantSampleAge) {
+        final written = max(0, sample.available - available);
+        final estimate = sample.important - written;
+        if (fits(estimate)) return estimate;
+      }
     }
+    int? important;
+    try {
+      important = query(path);
+    } catch (error) {
+      _log.fine('Important-usage capacity of $path is unknown: $error');
+    }
+    if (important == null || important <= 0) {
+      _importantSample = null;
+      return null;
+    }
+    _importantSample = (important: important, available: available, time: now);
+    return important;
   }
 
   var _loggedUnknownCapacity = false;
@@ -173,6 +237,32 @@ final class _NativeCapacity {
           Pointer<Uint64>),
       int Function(Pointer<Uint16>, Pointer<Uint64>, Pointer<Uint64>,
           Pointer<Uint64>)>('GetDiskFreeSpaceExW');
+  late final _coreFoundation = DynamicLibrary.open(
+      '/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation');
+  late final _importantUsageKey = _coreFoundation
+      .lookup<Pointer<Void>>(
+          'kCFURLVolumeAvailableCapacityForImportantUsageKey')
+      .value;
+  late final _cfUrlFromPath = _coreFoundation.lookupFunction<
+      Pointer<Void> Function(Pointer<Void>, Pointer<Uint8>, Long, Uint8),
+      Pointer<Void> Function(Pointer<Void>, Pointer<Uint8>, int,
+          int)>('CFURLCreateFromFileSystemRepresentation');
+  late final _cfCopyResourceProperty = _coreFoundation.lookupFunction<
+      Uint8 Function(
+          Pointer<Void>, Pointer<Void>, Pointer<Pointer<Void>>, Pointer<Void>),
+      int Function(Pointer<Void>, Pointer<Void>, Pointer<Pointer<Void>>,
+          Pointer<Void>)>('CFURLCopyResourcePropertyForKey');
+  late final _cfGetTypeId = _coreFoundation.lookupFunction<
+      UnsignedLong Function(Pointer<Void>),
+      int Function(Pointer<Void>)>('CFGetTypeID');
+  late final _cfNumberTypeId =
+      _coreFoundation.lookupFunction<UnsignedLong Function(), int Function()>(
+          'CFNumberGetTypeID')();
+  late final _cfNumberValue = _coreFoundation.lookupFunction<
+      Uint8 Function(Pointer<Void>, Long, Pointer<Int64>),
+      int Function(Pointer<Void>, int, Pointer<Int64>)>('CFNumberGetValue');
+  late final _cfRelease = _coreFoundation.lookupFunction<
+      Void Function(Pointer<Void>), void Function(Pointer<Void>)>('CFRelease');
 
   ({int available, int total}) query(String directory) {
     // Flutter's supported desktop ABIs are 64-bit. The buffer is larger than
@@ -221,6 +311,38 @@ final class _NativeCapacity {
       );
     } finally {
       _free(name);
+      _free(data);
+    }
+  }
+
+  /// kCFURLVolumeAvailableCapacityForImportantUsageKey of an existing
+  /// [directory]. Each sample creates its URL, so CoreFoundation's per-URL
+  /// resource value cache cannot hold a stale figure.
+  int? importantUsage(String directory) {
+    const cfNumberSInt64Type = 4;
+    final encoded = utf8.encode(directory);
+    // The copied property, then its value, then the path.
+    final data = _calloc(1, 16 + encoded.length);
+    if (data == nullptr) return null;
+    final property = data.cast<Pointer<Void>>();
+    final value = data.cast<Int64>() + 1;
+    final name = data.cast<Uint8>() + 16;
+    var url = nullptr.cast<Void>();
+    try {
+      name.asTypedList(encoded.length).setAll(0, encoded);
+      url = _cfUrlFromPath(nullptr, name, encoded.length, 1);
+      if (url == nullptr ||
+          _cfCopyResourceProperty(url, _importantUsageKey, property, nullptr) ==
+              0 ||
+          property.value == nullptr ||
+          _cfGetTypeId(property.value) != _cfNumberTypeId ||
+          _cfNumberValue(property.value, cfNumberSInt64Type, value) == 0) {
+        return null;
+      }
+      return value.value;
+    } finally {
+      if (property.value != nullptr) _cfRelease(property.value);
+      if (url != nullptr) _cfRelease(url);
       _free(data);
     }
   }
